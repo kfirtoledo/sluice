@@ -352,14 +352,19 @@ the cluster; stated honestly:
   (`fuse_allreduce_rms`/`norm_quant`/`act_quant`, flashinfer allreduce),
   but still crashes under concurrent load (c4/c16) with fusions off — so
   serialization and fusion-disabling only shift timing; neither is the
-  root cause. Sluice's Sluice-side stream edges are exonerated
-  (single-stream fills crash identically). Waves therefore default to
-  triton-class kernels only; marlin-class refuses oversized steps with
-  sizing guidance (`SLUICE_MK_WAVES=1` forces, unsafe under load; `=0`
-  forbids everywhere). Next diagnostic when this matters: compute-sanitizer
-  on the fast fp8-V2-Lite-class repro with the V4-Pro vendor path's
-  ingredients added one at a time. Operationally, 4-GPU V4-Pro startups
-  need `VLLM_ENGINE_READY_TIMEOUT_S` raised (~830 s to ready). NUMA
+  root cause. The generic stack is now **exonerated at load**: fp8-marlin
+  DP=2×TP=2 with waves forced survives a full concurrency stress (c8/c16,
+  192/192 requests, zero worker exceptions), with and without
+  `--kv-cache-dtype fp8`, and Sluice's own stream edges are exonerated
+  (single-stream fills crash identically). By elimination the
+  incompatibility lives in **V4-Pro's per-platform vendor model
+  implementation** (`models/deepseek_v4/nvidia`, custom fused ops), which
+  has no generic fallback on CUDA — so V4-Pro under DP stays blocked
+  pending an upstream fix; every other tested model runs DP with waves.
+  Marlin-class kernels outside the stress-validated shapes refuse
+  oversized steps with sizing guidance (`SLUICE_MK_WAVES=1` forces, `=0`
+  forbids). Operationally, 4-GPU V4-Pro startups need
+  `VLLM_ENGINE_READY_TIMEOUT_S` raised (~830 s to ready). NUMA
   placement of the pinned store turns out **not** to matter on the eval nodes:
   a per-GPU probe (mbind-bound buffers, both sockets) measured 51.6–51.75 GB/s
   local vs 51.0–51.1 GB/s remote (**~1.3%**) — PCIe Gen5 x16 is the binding
