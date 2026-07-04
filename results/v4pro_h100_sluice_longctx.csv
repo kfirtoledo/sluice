@@ -1,0 +1,9 @@
+# Sluice on 8xH100, vLLM 0.23.0, FP8, EP=8, SLUICE_SLOTS=16, ISL=8192, eager.
+# Offline steady-state (batch ~ concurrency), NDEC=64. per_user_tok_s = interactivity.
+# NOTE: at ISL=8192 the prefill chunk selects ~all 48 local experts/rank >> 16 slots,
+# so prefill DROPS experts (fast-but-lossy TTFT). Decode (small per-step set) is the
+# clean metric. batch=4 discarded: JIT (TileLang) compile fired mid-measurement.
+batch,per_user_tok_s,decode_tok_s,ttft_s,note
+1,4.67,4.67,0.93,ok
+8,4.22,33.73,1.36,ok
+4,,374.74,15.85,DISCARDED_jit_artifact

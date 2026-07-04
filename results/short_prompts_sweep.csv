@@ -1,0 +1,5 @@
+batch,config,slots,decode_tok_s,total_tok_s,pct_of_baseline,overflow,correct,status
+8,resident,0,242.74,238.47,100.0,0,1,ok
+8,slots,40,58.67,58.81,24.2,1,1,ok
+8,slots,48,76.05,76.0,31.3,0,1,ok
+8,slots,64,173.12,170.4,71.3,0,1,ok

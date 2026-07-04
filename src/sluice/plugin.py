@@ -33,6 +33,22 @@ def register() -> None:
                        SLOTS_ENV, raw)
         return
 
+    # Sluice hooks the V1 model runner's create_offloader/post_init lifecycle;
+    # the V2 runner never calls it, so Sluice would silently no-op (experts
+    # left resident, or OOM) AND its safety guards would never run. Refuse.
+    try:
+        import vllm.envs as vllm_envs
+
+        if getattr(vllm_envs, "VLLM_USE_V2_MODEL_RUNNER", False):
+            raise RuntimeError(
+                "Sluice requires the V1 model runner but VLLM_USE_V2_MODEL_RUNNER "
+                "is set — the V2 runner never invokes create_offloader/post_init, "
+                "so Sluice (and its correctness guards) would silently not run. "
+                "Unset VLLM_USE_V2_MODEL_RUNNER."
+            )
+    except ImportError:
+        pass
+
     import vllm.model_executor.offloader.base as base_mod
 
     from sluice.offloader import ExpertStreamOffloader

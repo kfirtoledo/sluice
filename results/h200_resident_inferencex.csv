@@ -1,0 +1,12 @@
+# Source: InferenceX (SemiAnalysis), DeepSeek-V4-Pro, h200_vllm, vLLM, fp8, TP=8, EP=8,
+# single 8xH200 node (not multinode), ISL 8192 / OSL 1024. tot_out_tok_s = out_per_gpu * 8.
+concurrency,interactivity_tok_s_user,out_per_gpu,tot_out_tok_s,tpot_ms
+1,44.50,4.708,37.67,22.47
+2,35.41,7.626,61.01,28.24
+4,31.91,14.265,114.12,31.34
+8,21.54,19.408,155.26,46.42
+16,14.35,26.351,210.81,69.68
+32,9.96,37.108,296.87,100.45
+64,7.97,44.144,353.15,125.42
+128,9.19,50.049,400.39,108.76
+256,9.01,49.531,396.25,111.01

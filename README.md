@@ -36,10 +36,39 @@ resident baseline (greedy, token ids). **V4-Pro** (FP8, EP=4) loads with just
 <p align="center"><img src="assets/chart-residency.png" alt="16 of 96 experts resident per layer/rank" width="560"></p>
 
 Streaming experts on demand costs only **~14%** throughput vs keeping them all
-resident (when the cache covers the per-step working set) — and lets V4-Pro
-serve at all, where it otherwise OOMs.
+resident (when the cache covers the per-step [working set](#sizing-the-cache)) —
+and lets V4-Pro serve at all, where it otherwise OOMs.
+
+Offloaded decode is PCIe-bound, so speculative decoding verifies extra tokens
+for free: with the checkpoint's own **MTP** module (`deepseek_mtp`, k=1),
+single-stream decode goes **4.9 → 8.2 tok/s (+67%, TPOT 168 → 106 ms)** on
+natural text, +48% at concurrency 4 (see
+[EVALUATION.md](docs/EVALUATION.md#speculative-decoding-mtp--offload--the-latency-regime-lever)).
 
 <p align="center"><img src="assets/chart-throughput.png" alt="Decode throughput: ~14% overhead on V2-Lite; V4-Pro runs only with Sluice" width="700"></p>
+
+## Sizing the cache
+
+`SLUICE_SLOTS` must be ≥ the **distinct experts selected in one forward step** —
+set by the step's token count, not `top_k`. Each token picks `top_k`, but a step
+unions them: decode grows ~linearly with batch, and **prefill** (a whole chunk)
+sets the ceiling. Measured on V2-Lite (64 experts, top-6, one H100):
+
+<p align="center"><img src="assets/chart-working-set.png" alt="Decode working set grows with batch (6/12/24/40); prefill sets the slot ceiling" width="620"></p>
+
+Below a step's working set the step executes in **waves** (multiple kernel
+launches, partials summed in fp32) — always exact in math, but slower per wave;
+more slots means fewer waves and fewer misses. Covering the working set isn't
+free either: experts still stream CPU→GPU each step, so throughput drops the
+further you are below full residency, more so at larger batches (larger working
+set):
+
+<p align="center"><img src="assets/measured/chart-perf-matrix.png" alt="Decode throughput retained across slots x batch; cells below the working set drop experts" width="720"></p>
+
+Size slots to the prefill working set, or cap it with a smaller
+`--max-num-batched-tokens`. Expert parallelism shards experts per rank, so the
+per-rank per-step set stays small and `slots ≪ experts` holds (V4-Pro serves at
+16 of 96 per rank); on one unsharded GPU the prefill set approaches all experts.
 
 ## Deploy DeepSeek-V4
 
