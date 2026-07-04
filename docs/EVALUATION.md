@@ -206,10 +206,14 @@ per-architecture code. Runtime-validated end-to-end on **two families**: DeepSee
 V4-Pro served at EP=8) and **Qwen** (Qwen1.5-MoE-A2.7B, `qwen2_moe`, 60 experts
 / top-4). On Qwen the offloader attached with no code change and was
 **bit-identical to the resident baseline at both full residency (`slots=60`) and
-offload (`slots=30`)** — same 24-token greedy hashes across all three. GLM
-(`glm4_moe`) is code-confirmed compatible but its cached checkpoint is incomplete
-(9 of 47 shards) on a full PVC, so it wasn't run; the mechanism is identical to
-the two validated families.
+offload (`slots=30`)** — same 24-token greedy hashes across all three. **GLM is
+now runtime-validated too**: GLM-4.5-Air (`glm4_moe`, 106B, 128 experts /
+top-8, bf16, TP=4/EP=4) is **bit-identical to resident at full residency
+(slots=32) and identical at offload (slots=12 — eviction plus prefill
+waves)**, again with zero per-architecture code. All three MoE families are
+validated end-to-end. (Full-residency sizing note: the slot cache at
+`slots=local_n` is the whole per-rank expert shard — GLM-4.5-Air needed
+`gpu_memory_utilization` 0.28 at TP=4, vs 0.50 for slots=12.)
 
 **Operational note — set a lower `gpu_memory_utilization` than resident.** The
 slot cache and map buffers are allocated in the offloader's `post_init`, *after*
