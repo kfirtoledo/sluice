@@ -122,9 +122,14 @@ int4. Measured on real V4-Pro expert tensors (45 expert-weights across layers
 gives **8.4% mean relative error** (w1 8.38%, w2 8.38%, w3 8.34%) vs **0.43%**
 for int8 — 3–8× the 1–3% that int4-from-BF16 achieves, the double-quantization
 penalty. 8.4% weight error is well past a <1% task-quality bar, and int8 saves
-nothing on an already-8-bit model. So for the production (already-quantized)
-path the tier is a no-go without an outlier-aware scheme (AWQ-class), a separate
-research effort. It remains viable only for *unquantized* (BF16) experts, where
+nothing on an already-8-bit model. **The outlier-aware escape hatch is now
+also measured closed**: protecting the top-10% input channels exactly (kept
+in FP8) drops error only to **7.9–8.0%** (row-wise grouping and group-64
+are similarly marginal: 8.1–8.4% across w1/w2/w3, 45 tensors) — the int4
+error on block-scaled-FP8 weights is uniformly distributed across channels,
+not outlier-concentrated, because the FP8 block scaling already flattened
+the structure AWQ-class schemes exploit. Double quantization is structural
+here, not fixable by channel selection. It remains viable only for *unquantized* (BF16) experts, where
 BF16→int8 is a single near-lossless step (~1.65× on V2-Lite b8/s24) — but those
 models are not the offloading target. Net: below-residency decode throughput is
 a hard PCIe floor for quantized MoE; Sluice's win is **capability** (serving
