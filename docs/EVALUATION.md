@@ -333,16 +333,21 @@ the cluster; stated honestly:
   Validated on V2-Lite: **DP=2 and DP=2×TP=2 both bit-identical to
   resident-DP**, including forced multi-wave configs and 8-way concurrency.
   Decode promotion is disabled under DP (gathered rows interleave ranks;
-  policy degrades to scan-resistant LRU). Two hard edges, both fail-fast:
-  (1) kernels that build per-expert token accounting internally (**marlin
-  class**) fault on a wave map that hides a selected expert — measured on
-  V4-Pro DP (CUDA illegal access on the first waved step) — so waves are
-  allowlisted to map-driven kernels (triton class); marlin-class DP works
-  only when `SLUICE_SLOTS` covers the per-step working set (impractical
-  below residency for large prefill), with `SLUICE_MK_WAVES` as the
-  override; (2) an MK whose seams can't be located is refused at startup.
-  Operationally, 4-GPU V4-Pro startups need `VLLM_ENGINE_READY_TIMEOUT_S`
-  raised (~830 s to ready; the default kills the engine while weights load). NUMA
+  policy degrades to scan-resistant LRU). Waves are validated on **both**
+  kernel classes: triton (V2-Lite, bit-identical at DP=2 and DP=2×TP=2) and
+  marlin (fp8 V2-Lite-class at DP=2 and DP=2×TP=2; **V4-Pro DP=2×TP=2**
+  serving clean). The one measured incompatibility — root-caused by
+  elimination across seven configurations — is vLLM's **custom fusion
+  passes** (`fuse_allreduce_rms`/`norm_quant`/`act_quant`, flashinfer
+  allreduce): fused collectives race with wave-looped MoE under DP (CUDA
+  illegal access; the same run passes serialized and passes with fusions
+  disabled). Under DP, run with `--compilation-config
+  '{"pass_config":{"fuse_allreduce_rms":false,"fuse_norm_quant":false,
+  "fuse_act_quant":false}}'` and `VLLM_ALLREDUCE_USE_FLASHINFER=0` (Sluice
+  warns if not). An MK whose seams can't be located is refused at startup;
+  `SLUICE_MK_WAVES=0` is a wave kill-switch. Operationally, 4-GPU V4-Pro
+  startups need `VLLM_ENGINE_READY_TIMEOUT_S` raised (~830 s to ready; the
+  default kills the engine while weights load). NUMA
   placement of the pinned store turns out **not** to matter on the eval nodes:
   a per-GPU probe (mbind-bound buffers, both sockets) measured 51.6–51.75 GB/s
   local vs 51.0–51.1 GB/s remote (**~1.3%**) — PCIe Gen5 x16 is the binding

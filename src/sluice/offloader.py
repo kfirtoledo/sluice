@@ -379,6 +379,27 @@ class ExpertStreamOffloader(BaseOffloader):
                     "Sluice: DP>1 enabled (SLUICE_ALLOW_DP=1) — decode "
                     "promotion disabled; cache policy is scan-resistant LRU."
                 )
+                # Custom fusion passes race with wave-looped MoE under DP
+                # (measured: CUDA illegal access on V4-Pro DP=2xTP=2; clean
+                # with them disabled). Warn unless they are explicitly off —
+                # defaults resolve per-model, so we cannot verify from here.
+                pcfg = getattr(
+                    getattr(cfg, "compilation_config", None), "pass_config", None
+                )
+                fusions = ("fuse_allreduce_rms", "fuse_norm_quant",
+                           "fuse_act_quant")
+                if pcfg is None or any(
+                    getattr(pcfg, k, None) is not False for k in fusions
+                ):
+                    logger.warning(
+                        "Sluice: DP>1 with custom fusion passes not "
+                        "explicitly disabled — fused collectives race with "
+                        "wave-looped MoE (CUDA illegal access). Run with "
+                        "--compilation-config '{\"pass_config\":"
+                        "{\"fuse_allreduce_rms\":false,\"fuse_norm_quant\":"
+                        "false,\"fuse_act_quant\":false}}' and "
+                        "VLLM_ALLREDUCE_USE_FLASHINFER=0."
+                    )
             if getattr(pc, "enable_eplb", False):
                 raise RuntimeError(
                     "Sluice: EPLB is unsupported (it re-registers the expert "
@@ -740,34 +761,21 @@ class ExpertStreamOffloader(BaseOffloader):
         leftover = missing[n_fills:]
         waves = [wave0]
         if leftover:
-            # Wave allowlist. Triton-class kernels wave exactly (validated
-            # bit-identical: V2-Lite DP=2 and DP=2xTP=2). Marlin-class waves
-            # are SEMANTICALLY correct (right greedy output under
-            # CUDA_LAUNCH_BLOCKING=1) but hit an async CUDA fault at real
-            # timing that is NOT in Sluice's cross-stream edges (single-
-            # stream fills crash identically) — an unresolved race in the
-            # repeated-experts-call interplay (workspace arena / mxfp4
-            # internals are the open suspects; compute-sanitizer session
-            # needed). Until root-caused, waves default off for non-triton
-            # kernels; refuse only when waves would actually be needed.
-            allow = os.environ.get("SLUICE_MK_WAVES")
-            if allow is None:
-                allow = (
-                    "1"
-                    if "Triton" in self._mk_experts_name.get(key, "")
-                    else "0"
-                )
-            if allow != "1":
+            # MK waves are validated on both kernel classes (bit-identical:
+            # V2-Lite triton DP=2 / DP=2xTP=2; clean: fp8-marlin DP=2 /
+            # DP=2xTP=2 and V4-Pro DP=2xTP=2). The one measured
+            # incompatibility is vLLM's custom fusion passes
+            # (fuse_allreduce_rms / norm_quant / act_quant, flashinfer
+            # allreduce) racing with wave-looped MoE under DP — a CUDA
+            # illegal access; disable them under DP (_check_config warns
+            # with the exact flags). SLUICE_MK_WAVES=0 remains the
+            # kill-switch: with it set, refuse instead of waving.
+            if os.environ.get("SLUICE_MK_WAVES", "1") == "0":
                 raise RuntimeError(
                     f"Sluice: this step selected {len(pairs)} local experts "
-                    f"> {cache.num_slots} slots, but the "
-                    f"'{self._mk_experts_name.get(key, 'unknown')}' experts "
-                    "kernel is not on the wave allowlist (count-driven "
-                    "kernels fault on wave maps). Raise SLUICE_SLOTS to "
-                    "cover the per-step working set, cap "
-                    "--max-num-batched-tokens to shrink prefill steps, or "
-                    "set SLUICE_MK_WAVES=1 to override for a map-driven "
-                    "kernel."
+                    f"> {cache.num_slots} slots and SLUICE_MK_WAVES=0 "
+                    "forbids waves. Raise SLUICE_SLOTS or cap "
+                    "--max-num-batched-tokens."
                 )
             # Rotation window for the remaining waves. No pipelining, so any
             # slots may be reused once the previous wave's kernel is ordered
