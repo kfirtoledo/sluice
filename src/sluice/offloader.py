@@ -761,21 +761,33 @@ class ExpertStreamOffloader(BaseOffloader):
         leftover = missing[n_fills:]
         waves = [wave0]
         if leftover:
-            # MK waves are validated on both kernel classes (bit-identical:
-            # V2-Lite triton DP=2 / DP=2xTP=2; clean: fp8-marlin DP=2 /
-            # DP=2xTP=2 and V4-Pro DP=2xTP=2). The one measured
-            # incompatibility is vLLM's custom fusion passes
-            # (fuse_allreduce_rms / norm_quant / act_quant, flashinfer
-            # allreduce) racing with wave-looped MoE under DP — a CUDA
-            # illegal access; disable them under DP (_check_config warns
-            # with the exact flags). SLUICE_MK_WAVES=0 remains the
-            # kill-switch: with it set, refuse instead of waving.
-            if os.environ.get("SLUICE_MK_WAVES", "1") == "0":
+            # Wave allowlist (restored after a premature relax). Waves are
+            # SEMANTICALLY correct on every kernel class (bit-identical on
+            # triton; correct greedy output on marlin under serialized
+            # launch), but marlin-class timing hits an async CUDA fault at
+            # real speed: single completions pass with the custom fusion
+            # passes disabled, yet concurrent load (c4/c16) still crashes —
+            # so fusions and CUDA_LAUNCH_BLOCKING merely shift timing; the
+            # underlying race (V4-Pro vendor-model path x wave-looped MoE
+            # under DP) is unresolved. Default: triton-class kernels wave;
+            # others refuse with sizing guidance. SLUICE_MK_WAVES=1 forces
+            # (debugging), =0 forbids everywhere.
+            allow = os.environ.get("SLUICE_MK_WAVES")
+            if allow is None:
+                allow = (
+                    "1"
+                    if "Triton" in self._mk_experts_name.get(key, "")
+                    else "0"
+                )
+            if allow != "1":
                 raise RuntimeError(
                     f"Sluice: this step selected {len(pairs)} local experts "
-                    f"> {cache.num_slots} slots and SLUICE_MK_WAVES=0 "
-                    "forbids waves. Raise SLUICE_SLOTS or cap "
-                    "--max-num-batched-tokens."
+                    f"> {cache.num_slots} slots, but waves on the "
+                    f"'{self._mk_experts_name.get(key, 'unknown')}' experts "
+                    "kernel hit an unresolved async fault at load (see "
+                    "docs). Raise SLUICE_SLOTS to cover the per-step "
+                    "working set, cap --max-num-batched-tokens, or force "
+                    "with SLUICE_MK_WAVES=1 (unsafe under load)."
                 )
             # Rotation window for the remaining waves. No pipelining, so any
             # slots may be reused once the previous wave's kernel is ordered

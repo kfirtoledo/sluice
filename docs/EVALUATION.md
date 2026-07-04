@@ -338,21 +338,24 @@ the cluster; stated honestly:
   Validated on V2-Lite: **DP=2 and DP=2×TP=2 both bit-identical to
   resident-DP**, including forced multi-wave configs and 8-way concurrency.
   Decode promotion is disabled under DP (gathered rows interleave ranks;
-  policy degrades to scan-resistant LRU). Waves are validated on **both**
-  kernel classes: triton (V2-Lite, bit-identical at DP=2 and DP=2×TP=2) and
-  marlin (fp8 V2-Lite-class at DP=2 and DP=2×TP=2; **V4-Pro DP=2×TP=2**
-  serving clean). The one measured incompatibility — root-caused by
-  elimination across seven configurations — is vLLM's **custom fusion
-  passes** (`fuse_allreduce_rms`/`norm_quant`/`act_quant`, flashinfer
-  allreduce): fused collectives race with wave-looped MoE under DP (CUDA
-  illegal access; the same run passes serialized and passes with fusions
-  disabled). Under DP, run with `--compilation-config
-  '{"pass_config":{"fuse_allreduce_rms":false,"fuse_norm_quant":false,
-  "fuse_act_quant":false}}'` and `VLLM_ALLREDUCE_USE_FLASHINFER=0` (Sluice
-  warns if not). An MK whose seams can't be located is refused at startup;
-  `SLUICE_MK_WAVES=0` is a wave kill-switch. Operationally, 4-GPU V4-Pro
-  startups need `VLLM_ENGINE_READY_TIMEOUT_S` raised (~830 s to ready; the
-  default kills the engine while weights load). NUMA
+  policy degrades to scan-resistant LRU). Wave **semantics** hold on both
+  kernel classes (triton: bit-identical at DP=2 and DP=2×TP=2 including
+  forced waves and 8-way concurrency; fp8-marlin V2-Lite-class: clean at
+  DP=2 and DP=2×TP=2). On **V4-Pro (marlin, vendor model path)** an async
+  CUDA fault remains **unresolved at real timing under load**: the same
+  configuration produces correct output under `CUDA_LAUNCH_BLOCKING=1`,
+  passes single completions with the custom fusion passes disabled
+  (`fuse_allreduce_rms`/`norm_quant`/`act_quant`, flashinfer allreduce),
+  but still crashes under concurrent load (c4/c16) with fusions off — so
+  serialization and fusion-disabling only shift timing; neither is the
+  root cause. Sluice's Sluice-side stream edges are exonerated
+  (single-stream fills crash identically). Waves therefore default to
+  triton-class kernels only; marlin-class refuses oversized steps with
+  sizing guidance (`SLUICE_MK_WAVES=1` forces, unsafe under load; `=0`
+  forbids everywhere). Next diagnostic when this matters: compute-sanitizer
+  on the fast fp8-V2-Lite-class repro with the V4-Pro vendor path's
+  ingredients added one at a time. Operationally, 4-GPU V4-Pro startups
+  need `VLLM_ENGINE_READY_TIMEOUT_S` raised (~830 s to ready). NUMA
   placement of the pinned store turns out **not** to matter on the eval nodes:
   a per-GPU probe (mbind-bound buffers, both sockets) measured 51.6–51.75 GB/s
   local vs 51.0–51.1 GB/s remote (**~1.3%**) — PCIe Gen5 x16 is the binding
