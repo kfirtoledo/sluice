@@ -306,6 +306,17 @@ the checkpoint's own MTP module, k=1):
   (modulo the documented multi-wave near-tie flips); spec decode's rejection
   rule preserves the target distribution, and the target model here is the
   offloaded one.
+- **The physics replicates on a second family**: GLM-5.1-FP8 (705 GiB,
+  4×H100, slots=12) with its own MTP module (`method: mtp`, k=1) gains
+  **+58% single-stream (4.18 → 6.62 tok/s, TPOT 218 → 135 ms)** on
+  ShareGPT at acceptance 1.60 (59.6%/position); +7% at c4, where this
+  model's very low residency fraction (12 of 64 local experts/rank) makes
+  draft-layer streaming contend earlier than on V4-Pro. Note the sizing
+  rule's scale boundary observed here: at such low residency fractions
+  (s8 vs s12 of 64 local), slots-vs-KV reallocation moves c16 throughput
+  within the measured day-spread only (11.8–14.0 tok/s) — the lever needs
+  the residency knee within reach, as on V4-Pro (16–25 of 96) and
+  GLM-4.5-Air (12–20 of 32).
 
 ## Limits & red-team caveats
 
