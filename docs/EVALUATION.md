@@ -215,6 +215,23 @@ validated end-to-end. (Full-residency sizing note: the slot cache at
 `slots=local_n` is the whole per-rank expert shard — GLM-4.5-Air needed
 `gpu_memory_utilization` 0.28 at TP=4, vs 0.50 for slots=12.)
 
+**The capability and sizing results replicate on GLM at both scales:**
+
+- **GLM-5.1-FP8 (705 GiB checkpoint), 4×H100**: stock vLLM **OOMs during
+  load** (320 GiB total VRAM); **Sluice serves it** (slots=8, util 0.25 —
+  a deliberately conservative floor config) with correct greedy output and
+  a clean 64/64 serving run (14.0 tok/s @ c16, TPOT 1.08 s, untuned — the
+  KV-vs-slots rule applies for tuning). Second model family where Sluice
+  turns "cannot load" into "serves".
+- **KV-vs-slots on GLM-4.5-Air (bf16, TP=4/EP=4, c16)**: the rule
+  generalizes with far more headroom than on FP8 DeepSeek —
+  slots=20 @ util 0.35 hits **88.3 tok/s (TPOT 171 ms)** vs 32.4
+  (TPOT 474 ms) for slots=12 @ 0.50: **2.7×** from the same VRAM
+  reallocation, because bf16 misses cost twice the PCIe bytes and the
+  config sits on the steep part of the residency curve. Resident
+  reference: 226.5 tok/s (the model fits on 4 GPUs; GLM-4.5-Air is the
+  correctness/sizing vehicle, not the capability target).
+
 **Operational note — set a lower `gpu_memory_utilization` than resident.** The
 slot cache and map buffers are allocated in the offloader's `post_init`, *after*
 vLLM's memory profiler has already sized the KV cache to the utilization target,
