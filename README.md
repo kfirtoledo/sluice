@@ -42,8 +42,11 @@ and lets V4-Pro serve at all, where it otherwise OOMs.
 Offloaded decode is PCIe-bound, so speculative decoding verifies extra tokens
 for free: with the checkpoint's own **MTP** module (`deepseek_mtp`, k=1),
 single-stream decode goes **4.9 → 8.2 tok/s (+67%, TPOT 168 → 106 ms)** on
-natural text, +48% at concurrency 4 (see
+natural text, +48% at concurrency 4 — and the physics replicates on GLM-5.1
+(+58%; see
 [EVALUATION.md](docs/EVALUATION.md#speculative-decoding-mtp--offload--the-latency-regime-lever)).
+
+<p align="center"><img src="assets/measured/chart-mtp.png" alt="MTP nearly halves single-stream TPOT on both families" width="700"></p>
 
 <p align="center"><img src="assets/chart-throughput.png" alt="Decode throughput: ~14% overhead on V2-Lite; V4-Pro runs only with Sluice" width="700"></p>
 

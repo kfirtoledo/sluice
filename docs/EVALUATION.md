@@ -252,6 +252,8 @@ Same-pod sweep (V4-Pro EP=8, c16, in1024/out128, 4096 ctx, 80 GiB):
 | slots=22 @ util 0.40 | 39.2k | 62.9 | 212 ms |
 | slots=25 @ util 0.30 | 23.6k | **67.0** | **199 ms** |
 
+<p align="center"><img src="../assets/measured/chart-kv-vs-slots.png" alt="Same VRAM, same workload: reallocating KV headroom to expert slots" width="720"></p>
+
 Rule: size utilization so KV ≈ 1.5–2× the peak concurrent-token demand
 (`max_concurrency × (input+output)`), then give every remaining GiB to
 `SLUICE_SLOTS`. slots=28 was infeasible here (KV would fall below the c16

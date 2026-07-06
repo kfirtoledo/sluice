@@ -229,6 +229,128 @@ def throughput_chart(path):
     print("wrote", path)
 
 
+def _campaign_rows(csv_path):
+    """Index results/campaign_202607.csv rows by (experiment, bench)."""
+    import csv as _csv
+
+    with open(csv_path) as f:
+        return {(r["experiment"], r["bench"]): r for r in _csv.DictReader(f)}
+
+
+def mtp_chart(csv_path, path):
+    """MTP speculative decoding x offload, single stream (c1, ShareGPT,
+    output 128): offloaded decode is PCIe-bound, so verifying draft tokens is
+    nearly free — TPOT drops ~2x on both families. Reads the July-2026
+    campaign CSV (results_mtp2 = V4-Pro 8xH100 EP=8 slots=16;
+    results_glm51mtp = GLM-5.1-FP8 4xH100 EP=4 slots=12)."""
+    rows = _campaign_rows(csv_path)
+    fams = [
+        ("DeepSeek-V4-Pro\n8×H100 · slots=16", "results_mtp2",
+         "accept 1.6–1.7"),
+        ("GLM-5.1-FP8 (705 GiB)\n4×H100 · slots=12", "results_glm51mtp",
+         "accept 1.60"),
+    ]
+    plain = [float(rows[(e, "bench_plain_c1")]["mean_tpot_ms"]) for _, e, _ in fams]
+    mtp = [float(rows[(e, "bench_mtp_c1")]["mean_tpot_ms"]) for _, e, _ in fams]
+    tp_gain = [
+        float(rows[(e, "bench_mtp_c1")]["output_tok_s"])
+        / float(rows[(e, "bench_plain_c1")]["output_tok_s"]) - 1
+        for _, e, _ in fams
+    ]
+
+    fig, ax = plt.subplots(figsize=(8.2, 4.4), dpi=200)
+    x = range(len(fams))
+    w = 0.34
+    ax.bar([i - w / 2 for i in x], plain, w, color=INDIGO, label="offloaded")
+    ax.bar([i + w / 2 for i in x], mtp, w, color=TEAL, label="+ MTP (k=1)")
+    for i in x:
+        ax.text(i - w / 2, plain[i] + 4, f"{plain[i]:.0f}", ha="center",
+                fontsize=10, color=INK)
+        ax.text(i + w / 2, mtp[i] + 4, f"{mtp[i]:.0f}", ha="center",
+                fontsize=10, color=INK)
+        ax.annotate(f"TPOT −{(1 - mtp[i] / plain[i]) * 100:.0f}%",
+                    (i + w / 2, mtp[i] / 2), ha="center", color="white",
+                    fontsize=10, fontweight="bold")
+        ax.annotate(f"+{tp_gain[i] * 100:.0f}% tok/s",
+                    (i, max(plain[i], mtp[i]) + 26),
+                    ha="center", color=GREEN, fontsize=11, fontweight="bold")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([f for f, _, _ in fams], fontsize=10)
+    ax.set_ylabel("mean TPOT (ms/token) — lower is better", fontsize=10)
+    ax.set_ylim(0, max(plain) * 1.28)
+    ax.legend(frameon=False, fontsize=10, loc="upper left")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.set_title("Speculative decoding is nearly free on offloaded decode "
+                 "(single stream, ShareGPT)", fontsize=12.5, color=INK)
+    fig.text(0.5, -0.03, "PCIe-bound steps verify draft tokens at no transfer "
+             "cost · MTP module from each checkpoint · k=1 · greedy-equivalent "
+             "output", ha="center", fontsize=7.5, color="#7A828F")
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight", facecolor="white")
+    print("wrote", path)
+
+
+def kv_slots_chart(csv_path, path):
+    """The KV-vs-slots rule, measured on two families at c16 (1024 in / 128
+    out): KV beyond the workload's concurrent tokens is dead VRAM — respend it
+    on expert slots. Reads the campaign CSV (results_r6 = V4-Pro same-pod
+    sweep; results_glmserve = GLM-4.5-Air bf16 TP=4/EP=4)."""
+    rows = _campaign_rows(csv_path)
+    v4 = [("16 @ .55", "bench_s16"), ("22 @ .40", "bench_s22u0.40"),
+          ("25 @ .30", "bench_s25u0.30")]
+    glm = [("12 @ .50", "bench_s12"), ("20 @ .35", "bench_s20")]
+    v4v = [float(rows[("results_r6", b)]["output_tok_s"]) for _, b in v4]
+    glmv = [float(rows[("results_glmserve", b)]["output_tok_s"]) for _, b in glm]
+    glm_res = float(rows[("results_glmserve", "bench_resident")]["output_tok_s"])
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.4, 4.3), dpi=200,
+                                   gridspec_kw={"width_ratios": [1.15, 1]})
+    axL.bar(range(len(v4)), v4v, 0.58, color=TEAL)
+    for i, v in enumerate(v4v):
+        axL.text(i, v + 1.4, f"{v:.0f}", ha="center", fontsize=10, color=INK)
+    axL.annotate(f"+{(v4v[-1] / v4v[0] - 1) * 100:.0f}%", (len(v4) - 1, v4v[-1] + 8),
+                 ha="center", color=GREEN, fontsize=11, fontweight="bold")
+    axL.set_xticks(range(len(v4)))
+    axL.set_xticklabels([c for c, _ in v4], fontsize=10)
+    axL.set_title("V4-Pro (FP8) · 8×H100 · EP=8", fontsize=11,
+                  fontweight="bold", color=INK)
+    axL.set_ylim(0, max(v4v) * 1.3)
+    axL.set_ylabel("output tok/s @ c16", fontsize=10)
+    axL.set_xlabel("slots @ gpu_memory_utilization", fontsize=9.5)
+
+    xs = range(len(glm) + 1)
+    axR.bar([0, 1], glmv, 0.58, color=TEAL)
+    axR.bar([2], [glm_res], 0.58, color=GREY)
+    for i, v in enumerate(glmv):
+        axR.text(i, v + 5, f"{v:.0f}", ha="center", fontsize=10, color=INK)
+    axR.text(2, glm_res + 5, f"{glm_res:.0f}", ha="center", fontsize=10,
+             color=MUTED)
+    axR.annotate(f"{glmv[1] / glmv[0]:.1f}×", (1, glmv[1] + 26), ha="center",
+                 color=GREEN, fontsize=12, fontweight="bold")
+    axR.set_xticks(list(xs))
+    axR.set_xticklabels([c for c, _ in glm] + ["resident\n(fits anyway)"],
+                        fontsize=10)
+    axR.set_title("GLM-4.5-Air (BF16) · 4×H100 · EP=4", fontsize=11,
+                  fontweight="bold", color=INK)
+    axR.set_ylim(0, glm_res * 1.18)
+    axR.set_xlabel("slots @ gpu_memory_utilization", fontsize=9.5)
+
+    for ax in (axL, axR):
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+    fig.suptitle("Spend surplus KV on expert slots — same VRAM, same workload "
+                 "(c16, 1024 in / 128 out)", fontsize=12.5, fontweight="bold",
+                 color=INK)
+    fig.text(0.5, -0.03, "rule: size KV ≈ 1.5–2× peak concurrent tokens, give "
+             "the rest to SLUICE_SLOTS · needs the residency knee in reach "
+             "(see docs/EVALUATION.md)", ha="center", fontsize=7.5,
+             color="#7A828F")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(path, bbox_inches="tight", facecolor="white")
+    print("wrote", path)
+
+
 def slots_sweep_chart(csv_path, path):
     """Plot the measured SLUICE_SLOTS sweep produced by examples/bench_slots.py.
 
@@ -750,6 +872,11 @@ if __name__ == "__main__":
     parser.add_argument("--prefill-csv", default=None,
                         help="V4-Pro prefill CSV (length,ttft_s,ws_per_rank,slots); "
                              "renders the prefill TTFT + working-set chart")
+    parser.add_argument("--campaign-csv",
+                        default=os.path.join(here, "..", "results",
+                                             "campaign_202607.csv"),
+                        help="July-2026 campaign CSV; renders the MTP and "
+                             "KV-vs-slots charts when present")
     cli = parser.parse_args()
 
     # Measured charts (CSV-driven, from real runs) live in their own subdirectory,
@@ -782,3 +909,7 @@ if __name__ == "__main__":
                         os.path.join(measured, "chart-v4-matrix.png"))
     if cli.prefill_csv:
         prefill_chart(cli.prefill_csv, os.path.join(measured, "chart-prefill.png"))
+    if cli.campaign_csv and os.path.exists(cli.campaign_csv):
+        mtp_chart(cli.campaign_csv, os.path.join(measured, "chart-mtp.png"))
+        kv_slots_chart(cli.campaign_csv,
+                       os.path.join(measured, "chart-kv-vs-slots.png"))
