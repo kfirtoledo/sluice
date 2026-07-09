@@ -52,10 +52,26 @@ experts are confined to probation, so a chunked-prefill scan can never flush
 the decode-hot set. Multi-wave steps rotate through probation in ping-pong
 slot groups with wave k+1's misses prefetched on a dedicated copy stream while
 wave k computes.
+
+Graph modes
+-----------
+Default is eager (enforced at config time — a captured graph would freeze one
+step's expert map and replay stale routing). ``SLUICE_GRAPH`` permits full
+capture only at full residency (every layer static_full: the map is a constant
+identity). ``SLUICE_PIECEWISE`` keeps streaming but runs the hook eagerly in a
+dynamo graph break while attention/norms are captured as piecewise CUDA
+graphs. ``SLUICE_ROUTER_SPLIT`` (requires piecewise) splits *inside* the MoE
+layer: gate + select_experts and the fused-experts GEMM are captured, with one
+thin eager gap (``vllm::sluice_stream_gap``) between them that streams the
+step's missing experts and refreshes the expert map — graphs bake POINTERS,
+the gap rewrites CONTENTS. See ``attach_router_split``.
 """
 
+import atexit
 import itertools
+import json
 import os
+import time
 from collections import OrderedDict
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -82,6 +98,20 @@ NON_EXPERT_WEIGHTS = frozenset(
 PROTECT_FRAC_ENV = "SLUICE_PROTECT_FRAC"
 STATS_EVERY_ENV = "SLUICE_STATS_EVERY"
 LFU_ENV = "SLUICE_LFU"
+# Opt-in profiling: dump cumulative per-expert selection counts (EPLB-style
+# load statistics) as JSONL snapshots — the measurement half of a static
+# hot-expert pin. SLUICE_EXPERT_COUNTS=<dir> enables it (one file per rank);
+# SLUICE_EXPERT_COUNTS_EVERY sets the snapshot period in hook calls.
+COUNTS_DIR_ENV = "SLUICE_EXPERT_COUNTS"
+COUNTS_EVERY_ENV = "SLUICE_EXPERT_COUNTS_EVERY"
+# Opt-in static hot-expert pin: JSON file {"layers": {"<layer_ord>": [global
+# expert ids, ...]}} where layer_ord is the MoE-layer install order (the same
+# ordinal the SLUICE_EXPERT_COUNTS dumps use). Per layer, listed experts owned
+# by this rank are streamed into slots once at init and never evicted; the pin
+# budget is deducted from the protected segment so probation (the prefill
+# scan buffer) keeps its exact unpinned size. Derive the file from counts
+# dumps with examples/derive_pin_set.py.
+PIN_FILE_ENV = "SLUICE_PIN_FILE"
 # Halve the per-expert popularity counts every this many real steps, so the
 # protected set tracks the *current* hot experts instead of pinning whatever
 # was hot at startup (frequency aging — prevents stale LFU pinning).
@@ -113,6 +143,10 @@ class _ExpertLayerCache:
     # per-layer real-step counter driving periodic aging.
     freq: dict = field(default_factory=dict)
     lfu_steps: int = 0
+    # Statically pinned slots (PIN_FILE_ENV): filled at init, never evicted.
+    # They sit in NEITHER SLRU segment nor the free list, so _touch no-ops on
+    # them (hits cost nothing) and _acquire_slot can never pick them.
+    pinned_slots: set = field(default_factory=set)
     # Full residency: the slot cache holds every local expert, so the expert
     # map is the identity local_of and never changes — the routing hook is
     # pure overhead and is skipped entirely (behaves like a resident EP rank).
@@ -125,6 +159,14 @@ class _ExpertLayerCache:
     # copy is never torn. (Today the per-layer host sync already drains it;
     # the event keeps that safety explicit and survives removing the sync.)
     map_ev: "torch.cuda.Event | None" = None
+    # Hook-lite: True when expert_map_buf currently maps EVERY resident expert
+    # to its slot (a "standing" map), so an all-hit step needs no rewrite. Any
+    # sparse/wave map write clears it (see _write_map); _write_standing_map
+    # sets it.
+    map_is_standing: bool = False
+    # Lazy-sync: device bool mask over global ids, True where this rank owns
+    # the expert — for exact miss counting on the sync-free path.
+    owned_mask_dev: "torch.Tensor | None" = None
 
 
 class _StepStats:
@@ -218,6 +260,179 @@ class ExpertStreamOffloader(BaseOffloader):
         self.nonmla_classifier = (
             os.environ.get("SLUICE_NONMLA_CLASSIFIER", "0") == "1"
         )
+        # Hook-lite (opt-in): keep a STANDING expert map covering every
+        # resident expert (pinned + cached), so an all-hit single-wave step
+        # needs no per-layer map rewrite and no map_ev stall — the kernel runs
+        # against the already-correct map. Semantically identical to the
+        # legacy path (same evictions/promotions/output; the standing map is a
+        # superset of the sparse map, and non-selected mapped experts receive
+        # no tokens), it only elides the redundant H2D on hit steps. Targets
+        # the decode-solely / high-residency regime where the per-layer sync
+        # tax dominates. Does NOT remove the topk_ids D2H sync (that is
+        # SLUICE_LAZY_SYNC); measures how much of the hook floor is the map
+        # rewrite.
+        self.hook_lite = os.environ.get("SLUICE_HOOK_LITE", "0") == "1"
+        # Lazy-sync (opt-in, measurement-grade): the NEXT step past hook-lite.
+        # When the standing map covers every selected expert (guaranteed at
+        # full residency), an all-hit decode step needs nothing from the CPU —
+        # the map is already on the GPU and topk_ids is already on the GPU, so
+        # the kernel runs with NO per-layer topk_ids D2H sync, no unique/
+        # classify/pairs, no map write. This is the path that kills the ~60%
+        # of the hook tax that hook-lite v1 left (the sync + decision Python).
+        # It is OPTIMISTIC: it engages when every local expert is resident (so
+        # a miss is impossible), and a device miss counter verifies that held
+        # (0 == the run was exactly correct). Partial-residency production use
+        # needs a step-level fallback (not built here); this proves the ceiling.
+        self.lazy_sync = os.environ.get("SLUICE_LAZY_SYNC", "0") == "1"
+        if self.lazy_sync:
+            self.hook_lite = True  # lazy-sync needs the standing-map machinery
+        # Debug: force the streaming hook even at full residency (num_slots ==
+        # local experts), which normally takes the static_full bypass. Lets the
+        # sync-cost A/B (legacy vs hook-lite vs lazy-sync) run at a controlled
+        # 0-miss operating point instead of silently short-circuiting.
+        self.no_static_full = os.environ.get("SLUICE_NO_STATIC_FULL", "0") == "1"
+        # Verify the 0-miss invariant on the lazy path with a per-layer device
+        # miss counter. Correctness proof / telemetry only — it launches a few
+        # extra small kernels per layer, so it costs a few % and is OFF by
+        # default (the residency gate already guarantees correctness; the check
+        # only proves it). Turn on for validation runs, off for the ceiling.
+        self.lazy_miss_check = os.environ.get("SLUICE_LAZY_MISS_CHECK", "0") == "1"
+        # Graph mode (opt-in, M1): permit non-eager / CUDA-graph capture. SAFE
+        # ONLY when every layer is static_full — then the expert map is the
+        # constant identity (written once at init, never mutated), so a captured
+        # graph replays exactly correct routing. _check_config relaxes the eager
+        # guards under this flag; post_init then ASSERTS all-static_full and
+        # refuses otherwise (fail closed — a graph over the streaming hook would
+        # bake a stale map and be silently wrong).
+        self.graph_mode = os.environ.get("SLUICE_GRAPH", "0") == "1"
+        # Piecewise: keep offloading (slots < experts, hook runs) but force
+        # the hook to a dynamo graph break so it executes EAGER in the gap
+        # while attention/norms are captured as piecewise CUDA graphs —
+        # recovers the non-MoE launch overhead without capturing the
+        # streaming sync. Requires cudagraph_mode=PIECEWISE (FULL is refused).
+        # Foundation for ROUTER-SPLIT below.
+        self.piecewise = os.environ.get("SLUICE_PIECEWISE", "0") == "1"
+        # GEMM-graph (kept negative result — PARKED after five distinct
+        # capture hazards; superseded by ROUTER-SPLIT): capture a PRIVATE CUDA
+        # graph of the fused-experts call (original_apply) per (layer,
+        # token-count) bucket, and replay it on single-wave decode steps
+        # instead of launching its kernels eagerly. The gap then costs sync +
+        # stream + map-write + one replay. Static input buffers (copy-in per
+        # step); weights/map are read via their live pointers (contents may
+        # change — a graph bakes pointers, not values). Multi-wave/prefill/
+        # oversized steps fall back to the eager call. Any error disables it
+        # for the process (fail open to eager, never wrong).
+        # v2 target: the MODULAR KERNEL's forward (mk.forward) — the pure
+        # routed GEMM, BELOW apply(): below the shared experts and their
+        # aux-stream overlap that made apply()-level capture incorrect
+        # (four-round forensics, see hook/piecewise_results.md). mk.forward is
+        # single-stream tensor-in/tensor-out; weights are persistent instance
+        # attrs; the expert map is read via its live pointer. The apply()-level
+        # hazards (1)-(3) fixes carry over: side-effect copy-back, identity
+        # staging with per-replay verification, real-step gating.
+        self.gemm_graph = os.environ.get("SLUICE_GEMM_GRAPH", "0") == "1"
+        self._gg_step = False  # set by run_moe around the eligible apply call
+        # ROUTER-SPLIT (the validated graph-parity path): patch each
+        # runner's _forward_entry — TRACED python — so decode-sized steps run
+        #   select_experts [captured] -> sluice_stream_gap [the ONLY eager
+        #   gap: sync+stream+map write] -> torch.ops.vllm.fused_experts
+        #   [captured, reads slot-weights + map BY POINTER] -> shared MLP
+        #   [captured] -> (shared, routed)
+        # and the stock traced tail does all combine/scale/reduce (fidelity
+        # inherited, not reimplemented). Prefill (> slots//topk tokens)
+        # branches to the stock opaque path (classic hook, waves). vLLM's own
+        # capture handles the GEMM + shared — the aux-stream hazard that broke
+        # private capture never arises. Fidelity gate: under EAGER (compile
+        # off) the traced python runs plain, same kernels => bit-identical to
+        # stock, verified.
+        self.router_split = os.environ.get("SLUICE_ROUTER_SPLIT", "0") == "1"
+        self._rs_caches: list = []  # layer_idx -> cache (gap-op registry)
+        self._rs_gaps = 0  # DIAG: gap invocations
+        self._rs_misses = 0  # DIAG: experts streamed in from the gap
+        self._rs_layers = 0  # DIAG: layers patched by attach_router_split
+        # Single-wave branch boundary (tokens): set from the batch envelope at
+        # config time under piecewise; attach_router_split derives a per-layer
+        # fallback for eager runs.
+        self._rs_thr = None
+        # Perf diagnostic ONLY: gap returns without sync/stream/map-write, so
+        # the arm measures the structural cost of the graph splits alone.
+        # Outputs are INVALID (stale expert map).
+        self._rs_noop = os.environ.get("SLUICE_RS_NOOP", "0") == "1"
+        if self._rs_noop:
+            logger.warning(
+                "Sluice: SLUICE_RS_NOOP=1 — the router-split gap is a NO-OP; "
+                "OUTPUTS ARE INVALID (stale expert map). Perf diagnostic "
+                "only: never use this arm for quality or token comparison."
+            )
+        # All-hit fast path in the gap (exact; skips LRU bookkeeping on
+        # no-miss steps, keeps the D2H sync).
+        self._rs_fast_hit = os.environ.get("SLUICE_RS_FAST_HIT", "0") == "1"
+        self._rs_fast_hits = 0
+        # Staged-ids (kept negative result — measured 6-8% SLOWER than the
+        # classic sync gap): a capturable async D2H of topk_ids into a pinned
+        # per-layer buffer INSIDE the captured piece (right after select),
+        # doorbell-stamped; the gap spin-waits the doorbell instead of
+        # syncing the stream, overlapping PCIe latency with the piece's
+        # remaining GPU work. Bounded-spin fallback to the classic sync
+        # path self-heals capture passes (recorded, not executed).
+        self._rs_staged = os.environ.get("SLUICE_RS_STAGED", "0") == "1"
+        self._rs_stage: list = []  # layer_idx -> stage state
+        self._rs_stage_falls = 0  # DIAG: bounded-spin fallbacks
+        if self._rs_staged:
+            logger.warning(
+                "Sluice: SLUICE_RS_STAGED=1 — doorbell-staged topk_ids is a "
+                "kept NEGATIVE result (measured 6-8% slower than the classic "
+                "sync gap). Enable for re-measurement only."
+            )
+        if self.router_split:
+            self._register_stream_gap_op()
+        # LAZY-STEP (kept negative result — measured 12-17% SLOWER than the
+        # classic hook): run the whole forward OPTIMISTICALLY sync-free —
+        # every decode-sized layer whose standing map is valid skips the
+        # topk_ids D2H sync/planning and just launches the kernel, while a
+        # device counter accumulates misses (owned but unmapped selections).
+        # ONE boundary check per forward (in the model.forward wrapper
+        # installed by attach_model): zero misses → commit (the per-layer
+        # syncs collapse to one); misses → re-run the forward with the
+        # classic hooked path, which streams the misses and refreshes the
+        # standing maps. The same-step rerun is exact: attention rewrites the
+        # same KV slots for the same positions with corrected values, and
+        # sampling happens once, after. Bit-identical to classic by
+        # construction — but the rerun tax outweighs the saved syncs, so OFF.
+        self.lazy_step = os.environ.get("SLUICE_LAZY_STEP", "0") == "1"
+        if self.lazy_step:
+            self.hook_lite = True  # standing maps are the foundation
+            logger.warning(
+                "Sluice: SLUICE_LAZY_STEP=1 — the optimistic sync-free "
+                "forward is a kept NEGATIVE result (measured 12-17% slower "
+                "than the classic hook: miss-reruns outweigh the saved "
+                "syncs). Enable for re-measurement only."
+            )
+        self._lazy_now = False  # this forward is running the sync-free mode
+        self._lazy_ran = False  # >=1 lazy layer executed this forward
+        self._lazy_disabled = False
+        self._lstep_stats = [0, 0, 0]  # clean, miss-rerun, classic forwards
+        if self.gemm_graph:
+            logger.warning(
+                "Sluice: SLUICE_GEMM_GRAPH=1 — private mk-level capture is a "
+                "kept NEGATIVE result, PARKED after five distinct capture "
+                "hazards (see hook/piecewise_results.md); superseded by "
+                "SLUICE_ROUTER_SPLIT. Enable for re-measurement only, gated "
+                "by the bit-compare smoke."
+            )
+        self._gg: dict = {}  # (layer_key, ntok) -> capture entry
+        # Self-healing classification: args caught changing identity after
+        # being classified persistent (e.g. a reused-then-swapped output
+        # buffer) get forced per-step here and the key's buckets recapture.
+        self._gg_force_perstep: dict = {}  # layer_key -> {("a",i) | ("k",name)}
+        self._gg_disabled = False
+        self._gg_replays = 0
+        self._gg_captures = 0
+        self._lite_skips = 0  # all-hit steps that skipped the map rewrite
+        self._lite_writes = 0  # standing-map (re)writes after residency change
+        self._lite_marked = False
+        self._lazy_steps = 0  # per-layer calls served by the sync-free path
+        self._lazy_miss_dev = None  # device scalar: total misses on lazy path
         self._copy_stream: torch.cuda.Stream | None = None
         self._warned_waves = False
         # Diagnostics (SLUICE_DIAG=1): per-step working-set high-water marks +
@@ -230,6 +445,42 @@ class ExpertStreamOffloader(BaseOffloader):
         self._ws_hwm: dict[int, int] = {}
         self._stats = {"small": _StepStats(), "scan": _StepStats()}
         self._hook_calls = 0
+        # Opt-in per-expert selection-count profiling (COUNTS_DIR_ENV): per
+        # layer, two count vectors over GLOBAL expert ids (decode-class and
+        # scan-class selections). This rank's shard only, so EP rank files
+        # merge disjointly (each global id is counted by exactly one rank).
+        self._counts_dir = os.environ.get(COUNTS_DIR_ENV)
+        self._counts: dict[int, tuple[list[int], list[int]]] = {}
+        self._counts_meta: dict[int, tuple[int, str]] = {}
+        self._counts_calls = 0
+        self._counts_snap = 0
+        self._counts_file = None
+        if self._counts_dir:
+            try:
+                self._counts_every = int(
+                    os.environ.get(COUNTS_EVERY_ENV, "5000")
+                )
+            except ValueError:
+                self._counts_every = 5000
+            atexit.register(self._dump_expert_counts, True)
+        # Static pin (opt-in): parsed once here, applied per layer in
+        # _install_cache. A malformed or unreadable file fails loudly — a
+        # silently empty pin would invalidate any experiment built on it.
+        self._pin_layers: dict[int, list[int]] | None = None
+        self._pin_stats = [0, 0]  # [experts pinned, layers with pins], this rank
+        pin_path = os.environ.get(PIN_FILE_ENV)
+        if pin_path:
+            with open(pin_path) as f:
+                raw = json.load(f)
+            layers = raw.get("layers", raw)
+            self._pin_layers = {
+                int(k): [int(g) for g in v] for k, v in layers.items()
+            }
+            logger.info(
+                "Sluice: static pin file %s (%d layers listed).",
+                pin_path,
+                len(self._pin_layers),
+            )
         logger.info(
             "Sluice ExpertStreamOffloader enabled (%d cache slots per layer, "
             "protect_frac=%.2f).",
@@ -262,12 +513,43 @@ class ExpertStreamOffloader(BaseOffloader):
         # Consume lazily; prepare each layer as it is built so the GPU never
         # holds more than one layer's experts at a time during load.
         modules = []
+        debug_moe = os.environ.get("SLUICE_DEBUG_MOE")
         for module in modules_generator:
             for sub in module.modules():
+                if debug_moe:
+                    self._debug_dump_moe(sub)
                 if self._is_moe_layer(sub):
                     self._prepare_layer(sub)
             modules.append(module)
         return modules
+
+    @staticmethod
+    def _debug_dump_moe(module: nn.Module) -> None:
+        """SLUICE_DEBUG_MOE: log the layout of any module that smells MoE (has
+        a quant_method or an expert-count-ish attr) — attr names, values, and
+        the recurse=False params with shapes — so a new model's expert layout
+        can be diagnosed without guessing which attribute names it uses."""
+        expert_attrs = [
+            a for a in (
+                "local_num_experts", "global_num_experts", "num_experts",
+                "num_local_experts", "n_routed_experts", "num_experts_per_tok",
+                "ep_size", "expert_map",
+            ) if hasattr(module, a)
+        ]
+        if not expert_attrs and not hasattr(module, "quant_method"):
+            return
+        vals = {a: getattr(module, a, None) for a in expert_attrs
+                if a not in ("expert_map",)}
+        params = [
+            (name, tuple(p.shape), str(p.dtype).replace("torch.", ""))
+            for name, p in module.named_parameters(recurse=False)
+        ]
+        logger.warning(
+            "SLUICE_DEBUG_MOE %s: attrs=%s qm=%s is_moe=%s params=%s",
+            type(module).__name__, vals,
+            type(getattr(module, "quant_method", None)).__name__,
+            ExpertStreamOffloader._is_moe_layer(module), params,
+        )
 
     def _prepare_layer(self, module: nn.Module) -> None:
         """Move a layer's (still-empty) experts to CPU so the checkpoint loads
@@ -301,6 +583,22 @@ class ExpertStreamOffloader(BaseOffloader):
             self._install_cache(module)
             self._wrap_apply(module)
             torch.accelerator.empty_cache()
+        # Fail closed: SLUICE_GRAPH permitted non-eager in _check_config on the
+        # promise that every layer is static_full (constant identity map, safe
+        # to capture). Enforce that promise now that the caches exist — a graph
+        # over a streaming layer would replay stale routing (silently wrong).
+        if self.graph_mode:
+            streaming = [
+                k for k, c in self._caches.items() if not c.static_full
+            ]
+            if streaming:
+                raise RuntimeError(
+                    "Sluice: SLUICE_GRAPH=1 requires every layer to be "
+                    f"static_full (slots >= local experts), but {len(streaming)}"
+                    " layer(s) are streaming. A captured graph would freeze a "
+                    "changing expert map. Raise SLUICE_SLOTS to full residency "
+                    "or unset SLUICE_GRAPH."
+                )
         # Operator visibility: how much host memory the expert store holds and
         # how much VRAM the slot caches cost (per rank). The host figure is the
         # amount pinned when pin_memory is on — the value to size lockable RAM
@@ -324,6 +622,39 @@ class ExpertStreamOffloader(BaseOffloader):
                 " (pinned)" if self.pin_memory else " (pageable)",
                 vram_bytes / (1 << 30),
             )
+            if self._pin_stats[0]:
+                logger.info(
+                    "Sluice: static pin active — %d experts pinned across %d "
+                    "layers on this rank (budget taken from protected).",
+                    self._pin_stats[0],
+                    self._pin_stats[1],
+                )
+                # Filesystem engagement marker: sluice INFO logs are invisible
+                # in some engine subprocess configs, and experiments must be
+                # able to PROVE the pin engaged rather than trust a log line.
+                pin_path = os.environ.get(PIN_FILE_ENV)
+                if pin_path:
+                    try:
+                        try:
+                            import torch.distributed as dist
+
+                            rank = (
+                                dist.get_rank() if dist.is_initialized() else 0
+                            )
+                        except Exception:
+                            rank = 0
+                        with open(
+                            f"{pin_path}.applied.rank{rank}.json", "w"
+                        ) as f:
+                            json.dump(
+                                {
+                                    "pinned": self._pin_stats[0],
+                                    "layers": self._pin_stats[1],
+                                },
+                                f,
+                            )
+                    except Exception:
+                        logger.exception("Sluice: pin marker write failed")
 
     def _check_config(self) -> None:
         """Fail fast on configurations that would corrupt outputs silently,
@@ -410,21 +741,104 @@ class ExpertStreamOffloader(BaseOffloader):
         # the replay (stale routing → silently wrong), and stock torch.compile
         # (mode != NONE) skips the post_init where Sluice installs the cache
         # (experts stranded on CPU). Both are covered by requiring eager.
+        # SLUICE_GRAPH relaxes both eager guards: a captured graph is safe when
+        # the map is constant, which holds iff every layer is static_full.
+        # post_init asserts that after the caches exist (fail closed here would
+        # be premature — caches are not installed yet).
+        # SLUICE_PIECEWISE (experimental): permit non-eager PIECEWISE cudagraph.
+        # The per-layer hook is forced to a dynamo graph break (torch._dynamo.
+        # disable in _wrap_apply), so it runs EAGER in the gap while attention/
+        # norms are captured — the streaming sync never enters a captured
+        # region. FULL cudagraph is still refused (would capture the hook).
+        relax_eager = self.graph_mode or self.piecewise
         mc = getattr(cfg, "model_config", None)
-        if mc is not None and not getattr(mc, "enforce_eager", False):
+        if (
+            mc is not None
+            and not getattr(mc, "enforce_eager", False)
+            and not relax_eager
+        ):
             raise RuntimeError(
                 "Sluice: requires eager execution — run with --enforce-eager. "
                 "Without it, CUDA-graph capture freezes a stale expert map "
                 "(silently wrong output) and stock torch.compile skips the "
-                "post_init that installs Sluice's expert cache."
+                "post_init that installs Sluice's expert cache. "
+                "(Set SLUICE_GRAPH=1 only with slots >= experts / static_full.)"
             )
         cc = getattr(cfg, "compilation_config", None)
         cg = getattr(cc, "cudagraph_mode", None) if cc is not None else None
-        if cg is not None and getattr(cg, "name", str(cg)) != "NONE":
+        cg_name = getattr(cg, "name", str(cg)) if cg is not None else "NONE"
+        if self.piecewise and "FULL" in cg_name:
+            raise RuntimeError(
+                "Sluice: SLUICE_PIECEWISE requires PIECEWISE cudagraph (the hook "
+                f"runs eager in a graph break); got {cg_name}. FULL would try to "
+                "capture the hook's D2H sync."
+            )
+        if (
+            cg is not None
+            and cg_name != "NONE"
+            and not relax_eager
+        ):
             raise RuntimeError(
                 "Sluice: CUDA graphs would capture a frozen expert map and "
                 "replay it with stale routing (silently wrong outputs). Run "
                 "with enforce_eager (--enforce-eager)."
+            )
+        if self.piecewise and cc is not None:
+            # Make the MoE an eager gap: vLLM dispatches the whole MoE layer
+            # through the opaque custom ops vllm::moe_forward[_shared] (the
+            # streaming hook runs INSIDE them). Adding them to splitting_ops
+            # makes the fx splitter cut the compiled graph there, so the
+            # captured pieces hold only attention/norms and the hook (with its
+            # D2H sync and map writes) always executes eagerly in the gap.
+            # This runs at offloader construction, before the model is loaded
+            # and compiled, so the partitioner sees the appended list.
+            ops = list(getattr(cc, "splitting_ops", None) or [])
+            wanted = ["vllm::moe_forward", "vllm::moe_forward_shared"]
+            if self.router_split:
+                # the router-split's thin gap op must also be an eager gap
+                wanted.append("vllm::sluice_stream_gap")
+            added = [op for op in wanted if op not in ops]
+            cc.splitting_ops = ops + added
+            logger.info(
+                "Sluice: piecewise mode — MoE ops added to splitting_ops "
+                "(%s); the streaming hook runs in the eager gap.",
+                ", ".join(added) if added else "already present",
+            )
+        if self.router_split and self.piecewise and cc is not None:
+            # Dynamo traces the model ONCE, with the profile run's batch
+            # (max_num_batched_tokens) as the size hint, and vLLM's custom
+            # dispatcher never re-evaluates guards — so a Python size branch
+            # in the traced entry is burned in at trace time. The rsplit
+            # branch therefore only exists in the artifact if EVERY step fits
+            # it: bound the batch so tokens x topk always fits the slots
+            # (single-wave contract), and let the trace hint land on the
+            # rsplit side.
+            topk = 8
+            hf = getattr(mc, "hf_config", None) if mc is not None else None
+            for src in (hf, getattr(hf, "text_config", None)):
+                v = getattr(src, "num_experts_per_tok", None) if src else None
+                if v:
+                    topk = int(v)
+                    break
+            thr = max(1, self.expert_cache_slots // topk)
+            self._rs_thr = thr
+            sched = getattr(cfg, "scheduler_config", None)
+            mbt = getattr(sched, "max_num_batched_tokens", None)
+            if mbt is not None and mbt > thr:
+                raise RuntimeError(
+                    "Sluice router-split under piecewise compiles a single "
+                    "trace whose size branch is resolved at trace time; the "
+                    f"whole batch envelope must fit it. Got "
+                    f"max_num_batched_tokens={mbt} > slots//topk={thr}. "
+                    f"Set --max-num-batched-tokens {thr} (prefill runs in "
+                    f"{thr}-token chunks) or raise SLUICE_SLOTS."
+                )
+            logger.warning(
+                "Sluice: ROUTER-SPLIT envelope — max_num_batched_tokens=%s "
+                "<= slots//topk=%d; all steps take the traced split path "
+                "(single-wave by construction).",
+                mbt,
+                thr,
             )
         # Speculative decode / MTP: a decode request verifies (1 + k) tokens,
         # so the decode region is ndec*(1+k) rows. Record k so the pure-decode
@@ -531,7 +945,14 @@ class ExpertStreamOffloader(BaseOffloader):
             expert_in_slot=[None] * num_slots,
             free_slots=list(range(num_slots - 1, -1, -1)),
         )
-        cache.static_full = num_slots == local_n
+        resident_all = num_slots >= local_n
+        cache.static_full = resident_all and not self.no_static_full
+        # Fully-resident streaming cache: capacity fits every expert but the
+        # hook is forced on (SLUICE_NO_STATIC_FULL). Pre-fill all experts so
+        # residency starts complete and nothing ever streams — this is the
+        # controlled 0-miss operating point for measuring the hook's own cost
+        # (legacy vs hook-lite vs lazy-sync) and the lazy-sync ceiling.
+        prefill_resident = resident_all and not cache.static_full
         for name, p in per_expert.items():
             cpu = p.data.to("cpu")
             slot = torch.empty((num_slots, *p.shape[1:]), dtype=p.dtype, device=device)
@@ -544,6 +965,8 @@ class ExpertStreamOffloader(BaseOffloader):
                 if self.pin_memory:
                     cpu = cpu.pin_memory()
                 cache.cpu_store[name] = cpu
+                if prefill_resident:
+                    slot[:local_n].copy_(cpu)
             cache.gpu_cache[name] = slot
             p.data = slot
             cache.bytes_per_expert += cpu[0].nbytes
@@ -564,6 +987,15 @@ class ExpertStreamOffloader(BaseOffloader):
         cache.expert_map_buf = torch.full(
             (global_n,), -1, dtype=map_dtype, device=device
         )
+        if self.lazy_sync or self.lazy_step:
+            # Device mask over GLOBAL ids: True where this rank owns the expert.
+            # A lazy-path "miss" is an OWNED expert not resident (map == -1);
+            # non-owned ids are legitimately -1 (another rank handles them) and
+            # must not count. All-owned at TP=1 (mask all True).
+            owned = [0 <= lo < local_n for lo in cache.local_of]
+            cache.owned_mask_dev = torch.tensor(
+                owned, dtype=torch.bool, device=device
+            )
         if cache.static_full:
             # Persistent identity map (global -> its resident local slot); the
             # hook never runs, so this is the layer's only map write.
@@ -573,6 +1005,16 @@ class ExpertStreamOffloader(BaseOffloader):
             for local in range(local_n):
                 cache.slot_of[local] = local
                 cache.expert_in_slot[local] = local
+        elif prefill_resident:
+            # All experts pre-loaded (slot index == local index for the first
+            # local_n slots); kept OUT of the SLRU segments so _touch/eviction
+            # no-op on them (they never leave — like pins). The hook still runs
+            # and the first step establishes the standing map. Extra slots stay
+            # free. Residency is complete from step 1, so lazy-sync engages.
+            for local in range(local_n):
+                cache.slot_of[local] = local
+                cache.expert_in_slot[local] = local
+            cache.free_slots = list(range(num_slots - 1, local_n - 1, -1))
         # layer.expert_map is a property returning the _expert_map buffer.
         module.register_buffer("_expert_map", cache.expert_map_buf, persistent=False)
         map_host = torch.full((global_n,), -1, dtype=map_dtype, device="cpu")
@@ -580,6 +1022,16 @@ class ExpertStreamOffloader(BaseOffloader):
             map_host = map_host.pin_memory()
         cache.map_host = map_host
 
+        if self._pin_layers is not None and not cache.static_full:
+            self._apply_pins(cache, len(self._caches))
+        if self._counts_dir and not cache.static_full:
+            # static_full layers skip the routing hook entirely, so no counts
+            # can exist for them; profiling needs slots < local experts.
+            self._counts[id(module)] = ([0] * global_n, [0] * global_n)
+            self._counts_meta[id(module)] = (
+                len(self._caches),
+                getattr(module, "layer_name", "") or "",
+            )
         self._caches[id(module)] = cache
         logger.info(
             "Sluice: %d local experts -> %d GPU slots (%d protected), "
@@ -590,6 +1042,45 @@ class ExpertStreamOffloader(BaseOffloader):
             len(per_expert),
             cache.bytes_per_expert / (1 << 20),
         )
+
+    def _apply_pins(self, cache: _ExpertLayerCache, ordinal: int) -> None:
+        """Fill this layer's pinned slots from the pin file (one init-time H2D
+        copy per expert). Pins live outside both SLRU segments and the free
+        list, so no later path can evict them; their budget is deducted from
+        protected_cap so probation keeps its exact unpinned size and prefill
+        scan behavior is unchanged."""
+        wanted = self._pin_layers.get(ordinal, []) if self._pin_layers else []
+        if not wanted:
+            return
+        budget = cache.protected_cap
+        n = 0
+        for g in wanted:
+            if n >= budget:
+                logger.warning(
+                    "Sluice: layer %d pin list (%d ids) exceeds the protected "
+                    "budget (%d); pinning the first %d only.",
+                    ordinal,
+                    len(wanted),
+                    budget,
+                    n,
+                )
+                break
+            if not (0 <= g < len(cache.local_of)):
+                continue
+            local = cache.local_of[g]
+            if local < 0 or local in cache.slot_of or not cache.free_slots:
+                continue
+            slot = cache.free_slots.pop()
+            for name, gpu in cache.gpu_cache.items():
+                gpu[slot].copy_(cache.cpu_store[name][local])
+            cache.expert_in_slot[slot] = local
+            cache.slot_of[local] = slot
+            cache.pinned_slots.add(slot)
+            n += 1
+        if n:
+            cache.protected_cap -= n
+            self._pin_stats[0] += n
+            self._pin_stats[1] += 1
 
     def _wrap_apply(self, module: nn.Module) -> None:
         """Wrap the layer's modular ``quant_method.apply`` so the routing-aware
@@ -620,8 +1111,50 @@ class ExpertStreamOffloader(BaseOffloader):
                 return original_apply(*args, **kwargs)
             return offloader.run_moe(original_apply, args, kwargs, layer, topk_ids)
 
+        if self.piecewise:
+            # Force a dynamo graph break here: the hook (D2H sync + streaming)
+            # must run EAGER, outside any captured region. torch.compile then
+            # captures the surrounding attention/norms as piecewise graphs.
+            apply = torch._dynamo.disable(apply)
         quant_method.apply = apply
         quant_method._sluice_wrapped = True
+        if self.gemm_graph and not self._dp_mode:
+            self._wrap_mk_gemm_graph(module)
+
+    def _wrap_mk_gemm_graph(self, module: nn.Module) -> None:
+        """Wrap the modular impl's ``_fused_experts`` (the pure post-dispatch
+        expert GEMM — BELOW even FusedMoEKernel.apply, whose signature still
+        carries shared_experts and its aux-stream work) with the
+        private-capture replay. Engages only on steps run_moe flagged eligible
+        (_gg_step: real, single-wave, decode-sized); else passes through."""
+        mk = self._find_mk(module)
+        fe = getattr(mk, "_fused_experts", None) if mk is not None else None
+        if mk is None or not callable(fe):
+            logger.warning(
+                "Sluice: SLUICE_GEMM_GRAPH requested but no modular "
+                "_fused_experts seam found for this layer; no capture."
+            )
+            return
+        if getattr(mk, "_sluice_gg_wrapped", False):
+            return
+        offloader = self
+        key = id(module)
+
+        def _fused_experts(*fa, **fk):
+            if not offloader._gg_step or offloader._gg_disabled:
+                return fe(*fa, **fk)
+            ntok = None
+            for t in list(fa) + list(fk.values()):
+                if isinstance(t, torch.Tensor) and t.dim() >= 2:
+                    ntok = t.shape[0]
+                    break
+            if ntok is None or ntok > 16:
+                return fe(*fa, **fk)
+            out = offloader._gemm_graph_call(key, ntok, fe, fa, fk)
+            return out if out is not None else fe(*fa, **fk)
+
+        mk._fused_experts = _fused_experts
+        mk._sluice_gg_wrapped = True
 
     @staticmethod
     def _find_mk(module: nn.Module):
@@ -731,6 +1264,14 @@ class ExpertStreamOffloader(BaseOffloader):
                 local = local_of[g]
                 if local >= 0:
                     pairs.append((g, local))
+        if self._counts_dir and pairs and self._split_signal()[2]:
+            cnt = self._counts.get(key)
+            if cnt is not None:
+                # MK path is scan-only policy (no decode signal under DP).
+                _dec_arr, scan_arr = cnt
+                for g, _local in pairs:
+                    scan_arr[g] += 1
+                self._counts_tick()
         copy_stream = (
             None if self._mk_sync_fills else self._get_copy_stream(cache.device)
         )
@@ -795,9 +1336,12 @@ class ExpertStreamOffloader(BaseOffloader):
             # to keep bookkeeping simple.
             window = list(cache.probation)
             if not window:
-                window = list(range(cache.num_slots))[
-                    -max(1, cache.num_slots // 4):
-                ]
+                # (never a pinned slot: pins are immovable by contract)
+                window = [
+                    s
+                    for s in range(cache.num_slots)
+                    if s not in cache.pinned_slots
+                ][-max(1, cache.num_slots // 4):]
             w = len(window)
             for k in range(0, len(leftover), w):
                 chunk = leftover[k:k + w]
@@ -844,9 +1388,79 @@ class ExpertStreamOffloader(BaseOffloader):
                 cache.probation[slot] = None
         self._compute_wait_copies(copy_stream)
 
+    # -- per-expert selection counts (opt-in EPLB-style load profiling) ------
+
+    def _counts_tick(self) -> None:
+        """Advance the profiling clock; snapshot every COUNTS_EVERY calls."""
+        self._counts_calls += 1
+        if self._counts_calls % self._counts_every == 0:
+            self._dump_expert_counts(False)
+
+    def _dump_expert_counts(self, final: bool) -> None:
+        """Append one cumulative JSONL snapshot per layer (sparse: nonzero
+        counts only, keyed by GLOBAL expert id). One file per rank; EP shard
+        files merge disjointly. Never raises — profiling must not be able to
+        take down serving."""
+        if not self._counts_dir or not self._counts:
+            return
+        try:
+            if self._counts_file is None:
+                try:
+                    import torch.distributed as dist
+
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                except Exception:
+                    rank = int(os.environ.get("RANK", "0") or "0")
+                os.makedirs(self._counts_dir, exist_ok=True)
+                self._counts_file = open(
+                    os.path.join(
+                        self._counts_dir, f"expert_counts_rank{rank}.jsonl"
+                    ),
+                    "a",
+                )
+            self._counts_snap += 1
+            for key, (dec_arr, scan_arr) in self._counts.items():
+                ord_, name = self._counts_meta.get(key, (-1, ""))
+                self._counts_file.write(
+                    json.dumps(
+                        {
+                            "snap": self._counts_snap,
+                            "final": final,
+                            "ts": time.time(),
+                            "hook_calls": self._counts_calls,
+                            "steps_small": self._stats["small"].steps,
+                            "steps_scan": self._stats["scan"].steps,
+                            "layer": ord_,
+                            "layer_name": name,
+                            "n_global": len(dec_arr),
+                            "decode": {
+                                str(g): c for g, c in enumerate(dec_arr) if c
+                            },
+                            "scan": {
+                                str(g): c for g, c in enumerate(scan_arr) if c
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            self._counts_file.flush()
+        except Exception:
+            logger.exception("Sluice: expert-count dump failed (non-fatal)")
+
     # -- forward path (fired from the wrapped quant_method.apply) ------------
 
     def run_moe(self, original_apply, args, kwargs, module, topk_ids):
+        """Classic streaming hook, called in place of ``quant_method.apply``.
+
+        Reads the router's ``topk_ids`` (the one host sync per layer),
+        classifies the step (decode vs scan), streams the missing experts into
+        slots under the SLRU policy, rewrites the expert map, and runs the
+        wrapped kernel — once for single-wave steps, once per wave when the
+        working set exceeds the cache. Fast paths peel off first: static_full
+        layers bypass entirely; lazy-sync/lazy-step skip the host sync;
+        hook-lite skips redundant map rewrites on all-hit steps. Under
+        ROUTER-SPLIT, decode-sized steps never reach this hook (they run the
+        traced entry with the gap op); prefill-sized steps still land here."""
         cache = self._caches.get(id(module))
         if cache is None:
             return original_apply(*args, **kwargs)
@@ -865,10 +1479,64 @@ class ExpertStreamOffloader(BaseOffloader):
             )
         assert cache.map_host is not None and cache.expert_map_buf is not None
 
+        # Lazy-sync fast path: when the standing map is installed AND every
+        # local expert is resident (full residency — so a miss is impossible),
+        # the kernel has everything it needs on the GPU (standing map +
+        # topk_ids). Run it with NO topk_ids D2H sync, no unique/classify/pairs,
+        # no map write — this is what eliminates the per-layer host-sync tax.
+        # The residency gate makes it exactly correct (0 misses); a device
+        # counter proves that. (Partial residency needs a step-level miss
+        # fallback, not built here — this measures the ceiling.)
+        if (
+            self.lazy_sync
+            and cache.map_is_standing
+            and len(cache.slot_of) >= cache.local_num_experts
+        ):
+            if not self._lazy_steps and not self._lite_marked:
+                self._lite_marked = True
+                self._mark_hook_lite_engaged()
+            self._lazy_steps += 1
+            if self.lazy_miss_check and cache.owned_mask_dev is not None:
+                miss = (
+                    (cache.expert_map_buf[topk_ids] < 0)
+                    & cache.owned_mask_dev[topk_ids]
+                ).sum()
+                if self._lazy_miss_dev is None:
+                    self._lazy_miss_dev = torch.zeros(
+                        (), dtype=torch.long, device=topk_ids.device
+                    )
+                self._lazy_miss_dev += miss
+            return original_apply(*args, **kwargs)
+
+        nd, ndec, real_step = self._split_signal()
+        # LAZY-STEP fast path: sync-free optimistic layer. The standing map
+        # already routes every RESIDENT expert; a device counter accumulates
+        # misses for the ONE boundary check in the model-forward wrapper. No
+        # D2H, no python planning, no map write. Decode-sized steps only
+        # (dim0 is a python shape read — free); big scans keep the classic
+        # path so prefill never pays 2× reruns.
+        if (
+            self._lazy_now
+            and real_step
+            and cache.map_is_standing
+            and cache.owned_mask_dev is not None
+            and topk_ids.shape[0] <= 16
+        ):
+            miss = (
+                (cache.expert_map_buf[topk_ids] < 0)
+                & cache.owned_mask_dev[topk_ids]
+            ).sum()
+            if self._lazy_miss_dev is None:
+                self._lazy_miss_dev = torch.zeros(
+                    (), dtype=torch.long, device=topk_ids.device
+                )
+            self._lazy_miss_dev += miss
+            self._lazy_ran = True
+            return original_apply(*args, **kwargs)
+
         # One host sync per layer: the router's decisions gate everything.
         # A single D2H copy, then unique on CPU (slicing decode vs prefill
         # rows costs no extra sync).
-        nd, ndec, real_step = self._split_signal()
         ids_cpu = topk_ids.to("cpu")
         num_tokens = int(ids_cpu.shape[0])
 
@@ -961,7 +1629,12 @@ class ExpertStreamOffloader(BaseOffloader):
         if decode_ids is None and not mla_forced_scan and not self._dp_mode:
             # No per-token signal (dummy run, or non-MLA fallback): dummy runs
             # are pure scans; real steps fall back to the working-set size.
-            heuristic_friendly = real_step and ws <= max(cache.protected_cap, 1)
+            # Decode-set capacity for CLASSIFICATION is pinned + dynamic
+            # protected (protected_cap alone shrinks when pins deduct their
+            # budget, which would silently reclassify decode-ish steps as
+            # scans and disable their promotions — the Phase-1 arms artifact).
+            decode_cap = cache.protected_cap + len(cache.pinned_slots)
+            heuristic_friendly = real_step and ws <= max(decode_cap, 1)
             if heuristic_friendly:
                 pairs = [(g, local, True) for g, local, _ in pairs]
         if self._diag and real_step:
@@ -988,6 +1661,13 @@ class ExpertStreamOffloader(BaseOffloader):
             stats.steps += 1
             if self.lfu:
                 self._bump_freq(cache, pairs)
+            if self._counts_dir:
+                cnt = self._counts.get(id(module))
+                if cnt is not None:
+                    dec_arr, scan_arr = cnt
+                    for g, _local, dcls in pairs:
+                        (dec_arr if dcls else scan_arr)[g] += 1
+                    self._counts_tick()
 
         hits: list[tuple[int, int]] = []  # (g, slot)
         missing: list[tuple[int, int, bool]] = []  # (g, local, decode_class)
@@ -1031,9 +1711,45 @@ class ExpertStreamOffloader(BaseOffloader):
         if not leftover:
             if stats is not None:
                 stats.waves += 1
-            self._write_map(cache, wave0, pinned=True)
+            # real_step only: vLLM's memory-profiling and piecewise-capture
+            # passes are dummy runs — staging/capturing our private graph
+            # during THEIR capture corrupts memory (observed: illegal access).
+            gg_ntok = num_tokens if (
+                self.gemm_graph
+                and not self._gg_disabled
+                and real_step
+                and num_tokens <= 16
+                and not (
+                    torch.cuda.is_available()
+                    and torch.cuda.is_current_stream_capturing()
+                )
+            ) else 0
+            if self.hook_lite:
+                # Standing map covers every resident expert, so the selected
+                # (all-hit) set is already routed. Rewrite only when residency
+                # changed (taken) or the map isn't standing yet; otherwise skip
+                # the H2D and its map_ev stall entirely.
+                if taken or not cache.map_is_standing:
+                    self._write_standing_map(cache)
+                    self._lite_writes += 1
+                else:
+                    self._lite_skips += 1
+                    if not self._lite_marked:
+                        self._lite_marked = True
+                        self._mark_hook_lite_engaged()
+            else:
+                self._write_map(cache, wave0, pinned=True)
             if taken:  # streamed something: kernel must wait for the copies
                 self._compute_wait_copies(copy_stream)
+            if gg_ntok:
+                # Eligible step: the wrapped modular kernel (mk.forward, BELOW
+                # apply and its shared-experts/aux-stream work) captures or
+                # replays the routed GEMM. Flag is step-scoped.
+                self._gg_step = True
+                try:
+                    return original_apply(*args, **kwargs)
+                finally:
+                    self._gg_step = False
             return original_apply(*args, **kwargs)
 
         if real_step and not self._warned_waves:
@@ -1139,7 +1855,10 @@ class ExpertStreamOffloader(BaseOffloader):
         # slots are never touched, so the decode-hot set survives the scan.
         rot = list(cache.probation)
         if not rot:  # degenerate: no probation slots — rotate a small tail
-            rot = list(range(cache.num_slots))[-max(1, cache.num_slots // 4):]
+            # (never a pinned slot: pins are immovable by contract)
+            rot = [
+                s for s in range(cache.num_slots) if s not in cache.pinned_slots
+            ][-max(1, cache.num_slots // 4):]
         half = (len(rot) + 1) // 2
         group_a, group_b = rot[:half], rot[half:]
         pipelined = bool(group_b)
@@ -1386,6 +2105,606 @@ class ExpertStreamOffloader(BaseOffloader):
             if cache.map_ev is None:
                 cache.map_ev = torch.cuda.Event()
             cache.map_ev.record(torch.cuda.current_stream())
+        # Any raw (sparse/wave) map write invalidates the standing invariant;
+        # _write_standing_map re-establishes it after this returns.
+        cache.map_is_standing = False
+
+    def _write_standing_map(self, cache: _ExpertLayerCache) -> None:
+        """Install the STANDING map: every currently-resident expert points at
+        its slot (-1 elsewhere). Correct for any all-hit step regardless of
+        which experts it selects, so subsequent hits need no rewrite. Costs
+        one map H2D — paid only when residency changed."""
+        wave = [
+            (cache.global_of_local[local], slot)
+            for slot, local in enumerate(cache.expert_in_slot)
+            if local is not None
+        ]
+        self._write_map(cache, wave, pinned=True)
+        cache.map_is_standing = True
+
+    def _gemm_graph_call(self, key, ntok, original_apply, args, kwargs):
+        """Replay (capturing on first sight) a private CUDA graph of this
+        layer's fused-experts call for this token count.
+
+        A graph bakes POINTERS: per-step tensors (dim0 == ntok: hidden states,
+        topk ids/weights, router logits) are staged into static buffers and
+        copied in before each replay; persistent tensors (weights, scales —
+        stable layer attributes) and the expert-map buffer are captured via
+        their live pointers, whose CONTENTS the gap may update between
+        replays. Only single-wave decode-sized steps reach here; anything
+        unexpected disables the feature for the process and falls back to the
+        eager call (returns None). Correct by construction: the replayed work
+        is exactly the captured original_apply with identical inputs."""
+        try:
+            bucket = (key, ntok)
+            entry = self._gg.get(bucket)
+            if entry is None:
+                # First sighting: record every tensor arg's object identity,
+                # run eager. On the second sighting, args whose identity
+                # CHANGED are per-step (must be staged into static buffers);
+                # args with the SAME tensor object (layer weights, the expert
+                # map — module attributes) are persistent and captured via
+                # their live pointers. Identity-based classification has no
+                # holes, unlike any shape heuristic: ANY per-step tensor left
+                # unstaged would be captured as a dangling pointer and replay
+                # garbage once its memory is recycled.
+                self._gg[bucket] = {
+                    "ids": (
+                        [id(a) if isinstance(a, torch.Tensor) else None
+                         for a in args],
+                        {k: id(v) if isinstance(v, torch.Tensor) else None
+                         for k, v in kwargs.items()},
+                    )
+                }
+                return None  # eager this step
+            if "graph" not in entry and "ids" in entry:
+                aids, kids = entry["ids"]
+                if len(aids) != len(args) or set(kids) != set(kwargs):
+                    raise RuntimeError("apply arg structure changed")
+
+                forced = self._gg_force_perstep.get(key, set())
+
+                def stage(obj, prev_id, tag):
+                    if isinstance(obj, torch.Tensor):
+                        if id(obj) == prev_id and tag not in forced:
+                            return obj, False  # persistent: same object
+                        return obj.detach().clone(), True  # per-step: stage
+                    return obj, False
+
+                sargs, aflag = [], []
+                for i, (a, pid) in enumerate(zip(args, aids)):
+                    s, f = stage(a, pid, ("a", i))
+                    sargs.append(s)
+                    aflag.append(f)
+                skw, kflag = {}, {}
+                for k, v in kwargs.items():
+                    s, f = stage(v, kids[k], ("k", k))
+                    skw[k] = s
+                    kflag[k] = f
+                sargs = tuple(sargs)
+                if os.environ.get("SLUICE_GG_DEBUG") == "1":
+                    inv = []
+                    for i, a in enumerate(args):
+                        inv.append(
+                            f"arg{i}:{type(a).__name__}"
+                            + (f"{tuple(a.shape)}{'*' if aflag[i] else ''}"
+                               if isinstance(a, torch.Tensor) else "")
+                        )
+                    for k, v in kwargs.items():
+                        inv.append(
+                            f"{k}:{type(v).__name__}"
+                            + (f"{tuple(v.shape)}{'*' if kflag[k] else ''}"
+                               if isinstance(v, torch.Tensor) else "")
+                        )
+                    logger.warning(
+                        "Sluice GG_DEBUG bucket(ntok=%d): %s (*=per-step)",
+                        ntok, " ".join(inv),
+                    )
+
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    original_apply(*sargs, **skw)  # allocator warmup
+                torch.cuda.current_stream().wait_stream(side)
+                # The eager call mutates hidden_states in place (vllm registers
+                # moe_forward with mutates_args) — restore pristine inputs so
+                # the capture records the intended computation.
+                for live, static, f in zip(args, sargs, aflag):
+                    if f:
+                        static.copy_(live)
+                for k, f in kflag.items():
+                    if f:
+                        skw[k].copy_(kwargs[k])
+
+                graph = torch.cuda.CUDAGraph()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    with torch.cuda.graph(graph):
+                        out = original_apply(*sargs, **skw)
+                torch.cuda.current_stream().wait_stream(side)
+                if not isinstance(out, torch.Tensor):
+                    raise TypeError(f"apply returned {type(out)}")
+                entry = {
+                    "graph": graph,
+                    "sargs": sargs,
+                    "aflag": aflag,
+                    "skw": skw,
+                    "kflag": kflag,
+                    "out": out,
+                }
+                self._gg[(key, ntok)] = entry
+                self._gg_captures += 1
+
+            # copy this step's per-step tensors into the captured buffers; for
+            # persistent args VERIFY identity still holds (a replaced buffer
+            # would be a stale captured pointer → must disable, not corrupt)
+            if len(args) != len(entry["sargs"]):
+                raise RuntimeError("apply arg count changed")
+
+            def heal(tag):
+                # Identity lied (buffer reused for the first sightings, then
+                # swapped — e.g. output_alias). Force it per-step and rebuild
+                # every bucket of this layer; this step runs eager.
+                self._gg_force_perstep.setdefault(key, set()).add(tag)
+                for b in [b for b in self._gg if b[0] == key]:
+                    del self._gg[b]
+                logger.warning(
+                    "Sluice: GEMM-graph reclassified %s as per-step for layer "
+                    "%d (identity changed); recapturing.", tag, key,
+                )
+
+            for i, (live, static, f) in enumerate(
+                zip(args, entry["sargs"], entry["aflag"])
+            ):
+                if f:
+                    static.copy_(live, non_blocking=True)
+                elif isinstance(live, torch.Tensor) and live is not static:
+                    heal(("a", i))
+                    return None
+            for k, f in entry["kflag"].items():
+                if f:
+                    entry["skw"][k].copy_(kwargs[k], non_blocking=True)
+                elif (
+                    isinstance(kwargs[k], torch.Tensor)
+                    and kwargs[k] is not entry["skw"][k]
+                ):
+                    heal(("k", k))
+                    return None
+            entry["graph"].replay()
+            self._gg_replays += 1
+            # Mirror the eager call's side effects: the op mutates
+            # hidden_states in place and downstream may read the LIVE tensor —
+            # propagate every per-step buffer back (harmless for unmutated
+            # ones; restores the contract for mutated ones).
+            for live, static, f in zip(args, entry["sargs"], entry["aflag"]):
+                if f:
+                    live.copy_(static, non_blocking=True)
+            for k, f in entry["kflag"].items():
+                if f:
+                    kwargs[k].copy_(entry["skw"][k], non_blocking=True)
+            # clone: downstream must not alias the static output buffer the
+            # next replay will overwrite.
+            return entry["out"].clone()
+        except Exception:
+            if not self._gg_disabled:
+                self._gg_disabled = True
+                logger.exception(
+                    "Sluice: GEMM-graph disabled after error (eager fallback)."
+                )
+            return None
+
+    def _register_stream_gap_op(self) -> None:
+        """Register ``vllm::sluice_stream_gap`` — the router-split's thin
+        eager gap. Functionally pure to the graph (returns a clone consumed by
+        fused_experts, enforcing ordering by dataflow); its side effect is
+        streaming this step's missing experts into slots and refreshing the
+        standing map, which the captured fused_experts then reads by pointer.
+
+        Under SLUICE_RS_STAGED (kept negative result) this also registers
+        ``vllm::sluice_stage_ids``: a capturable async D2H of topk_ids into a
+        pinned per-layer buffer plus a doorbell stamp, so the gap can
+        spin-wait the doorbell instead of syncing the stream."""
+        from vllm.utils.torch_utils import direct_register_custom_op
+
+        offloader = self
+
+        def _sluice_stream_gap(
+            hidden_states: torch.Tensor,
+            topk_ids: torch.Tensor,
+            layer_idx: int,
+        ) -> torch.Tensor:
+            offloader._router_split_gap(int(layer_idx), topk_ids)
+            return hidden_states.clone()
+
+        def _sluice_stream_gap_fake(
+            hidden_states: torch.Tensor,
+            topk_ids: torch.Tensor,
+            layer_idx: int,
+        ) -> torch.Tensor:
+            return torch.empty_like(hidden_states)
+
+        direct_register_custom_op(
+            op_name="sluice_stream_gap",
+            op_func=_sluice_stream_gap,
+            mutates_args=[],
+            fake_impl=_sluice_stream_gap_fake,
+        )
+
+        if self._rs_staged:
+
+            def _sluice_stage_ids(
+                topk_ids: torch.Tensor, layer_idx: int
+            ) -> torch.Tensor:
+                st = offloader._rs_stage[int(layer_idx)]
+                n = topk_ids.numel()
+                # Ordered on the compute stream: ids land in pinned memory,
+                # THEN the doorbell advances — stamp visible implies ids
+                # visible. Both copies are capturable (async memcpy nodes).
+                st["pin_ids"][:n].copy_(
+                    topk_ids.view(-1).to(torch.int32), non_blocking=True
+                )
+                st["dev_stamp"] += 1
+                st["pin_stamp"].copy_(st["dev_stamp"], non_blocking=True)
+                return topk_ids
+
+            def _sluice_stage_ids_fake(
+                topk_ids: torch.Tensor, layer_idx: int
+            ) -> torch.Tensor:
+                return torch.empty_like(topk_ids)
+
+            direct_register_custom_op(
+                op_name="sluice_stage_ids",
+                op_func=_sluice_stage_ids,
+                mutates_args=[],
+                fake_impl=_sluice_stage_ids_fake,
+            )
+
+    def _router_split_gap(self, idx: int, topk_ids: torch.Tensor) -> None:
+        """Body of ``vllm::sluice_stream_gap`` — router-split's only eager
+        region: one D2H of the tiny topk tensor (or a doorbell read under
+        SLUICE_RS_STAGED), stream the misses, refresh the standing map the
+        captured fused_experts reads by pointer. SLUICE_RS_FAST_HIT skips the
+        LRU bookkeeping on all-hit steps (exact — the D2H anchor stays).
+        Single-wave by contract (decode-sized steps only, slots >= working
+        set); overflow is a loud error, never a wrong answer."""
+        cache = self._rs_caches[idx]
+        self._rs_gaps += 1
+        # Self-report: when rsplit covers every small batch the classic hook
+        # (and its periodic DIAG printer) never runs — engagement of BOTH the
+        # hit and miss paths must be visible from the gap itself.
+        if self._rs_gaps == 1 or self._rs_gaps % 2000 == 0:
+            logger.warning(
+                "Sluice DIAG[rs]: router-split layers=%d gap-calls=%d "
+                "misses=%d fast-hits=%d stage-falls=%d%s",
+                len(self._rs_caches),
+                self._rs_gaps,
+                self._rs_misses,
+                self._rs_fast_hits,
+                self._rs_stage_falls,
+                " NOOP-GAP(OUTPUTS INVALID)" if self._rs_noop else "",
+            )
+        if self._rs_noop:
+            return
+        ids_list = None
+        if self._rs_staged and idx < len(self._rs_stage):
+            st = self._rs_stage[idx]
+            target = st["seen"] + 1
+            pin_stamp = st["pin_stamp"]
+            t0 = time.perf_counter()
+            while int(pin_stamp[0]) < target:
+                if time.perf_counter() - t0 > 0.01:
+                    break
+            if int(pin_stamp[0]) >= target:
+                st["seen"] = int(pin_stamp[0])
+                ids_list = st["pin_ids"][: topk_ids.numel()].tolist()
+            else:
+                # Capture pass (recorded, not executed) or a stall: classic
+                # sync path, then resync the doorbell bookkeeping.
+                self._rs_stage_falls += 1
+                st["seen"] = int(pin_stamp[0])
+        if ids_list is None:
+            ids_list = topk_ids.to("cpu").view(-1).tolist()
+        local_of = cache.local_of
+        n_global = len(local_of)
+        if self._rs_fast_hit and cache.map_is_standing:
+            # All-hit fast path: the standing map already covers every
+            # resident expert, so a step with no misses needs NO unique, NO
+            # LRU touches, NO map-write check. Recency goes stale on hit
+            # steps — that only shifts victim choice on (rare) misses, never
+            # correctness. The D2H (sync or staged doorbell) stays: it is
+            # the exactness anchor.
+            slot_of = cache.slot_of
+            for g in ids_list:
+                if 0 <= g < n_global:
+                    local = local_of[g]
+                    if local >= 0 and local not in slot_of:
+                        break
+            else:
+                self._rs_fast_hits += 1
+                return
+        # sorted(set()) matches torch.unique's sorted order exactly, so slot
+        # placement sequences stay comparable across variants.
+        selected = sorted(set(ids_list))
+        missing = []
+        hit_slots = set()
+        changed = False
+        for g in selected:
+            if 0 <= g < n_global:
+                local = local_of[g]
+                if local < 0:
+                    continue
+                slot = cache.slot_of.get(local)
+                if slot is None:
+                    missing.append(local)
+                else:
+                    hit_slots.add(slot)
+                    self._touch(cache, slot, True)
+        if missing:
+            copy_stream = self._get_copy_stream(cache.device)
+            if copy_stream is not None:
+                ev = torch.cuda.Event()
+                ev.record(torch.cuda.current_stream())
+                copy_stream.wait_event(ev)
+            # Seed the no-evict set with THIS STEP'S HIT SLOTS: evicting a
+            # selected resident to admit a selected miss hands the GEMM a
+            # slot whose weights were overwritten mid-step (garbage/NaN at
+            # uniques == slots). The envelope guarantees feasibility:
+            # |selected| <= slots  =>  non-selected slots >= misses.
+            claimed = set(hit_slots)
+            for local in missing:
+                slot = self._acquire_slot(cache, local, claimed, True)
+                if slot is None:
+                    raise RuntimeError(
+                        "Sluice router-split: working set exceeds slots on a "
+                        "decode-sized step; raise SLUICE_SLOTS."
+                    )
+                self._stream_in(cache, local, slot, copy_stream)
+                claimed.add(slot)
+            self._rs_misses += len(missing)
+            self._compute_wait_copies(copy_stream)
+            changed = True
+        if changed or not cache.map_is_standing:
+            self._write_standing_map(cache)
+
+    def attach_router_split(self, model: nn.Module) -> None:
+        """Arm ROUTER-SPLIT: patch each supported MoE layer's
+        ``runner._forward_entry`` with the traced split path
+
+            gate linear + select_experts   [captured]
+            -> sluice_stream_gap           [eager: sync + stream + map]
+            -> torch.ops.vllm.fused_experts [captured; weights/map by pointer]
+            -> shared experts              [captured]
+
+        for steps of <= threshold tokens (slots//topk — single-wave by
+        construction); larger steps call the original entry, i.e. the stock
+        opaque path with the classic wave-capable hook. Layers missing a
+        required seam (no runner, monolithic kernel, fused gate, naive
+        dispatch, pcp>1, static_full) keep the stock path untouched — fail
+        closed to correctness, counted in the ``skips`` log; the eager
+        bit-gate validates the rest."""
+        if not self.router_split:
+            return
+        patched = 0
+        skips: dict = {}
+
+        def skip(reason):
+            skips[reason] = skips.get(reason, 0) + 1
+
+        seen_moe = 0
+        for module in model.modules():
+            cache = self._caches.get(id(module))
+            if cache is None:
+                continue
+            seen_moe += 1
+            runner = getattr(module, "runner", None)
+            if runner is None:
+                skip("no-runner")
+                continue
+            if cache.static_full:
+                skip("static-full")
+                continue
+            try:
+                qm = runner._quant_method
+                if getattr(qm, "is_monolithic", False):
+                    skip("monolithic")
+                    continue
+                # Runner-held gate is fine — the traced entry mirrors stock
+                # (`router_logits, _ = self.gate(hidden)`), a plain traceable
+                # linear. Only the fused-gate variant is out of scope.
+                gate = getattr(runner, "gate", None)
+                if gate is not None and getattr(runner, "_fse_fuse_gate", False):
+                    skip("fused-gate")
+                    continue
+                if getattr(runner, "do_naive_dispatch_combine", False):
+                    skip("naive-dispatch")
+                    continue
+                mc = getattr(runner, "moe_config", None)
+                if mc is not None and getattr(mc, "pcp_size", 1) > 1:
+                    skip("pcp")
+                    continue
+                w13 = module.w13_weight
+                w2 = module.w2_weight
+                gne = int(module.global_num_experts)
+                emap = cache.expert_map_buf
+                se = getattr(runner, "_shared_experts", None)
+                shared_layer = getattr(se, "_layer", None) if se is not None else None
+                sel = runner.router.select_experts
+                orig_entry = runner._forward_entry
+                topk = getattr(mc, "experts_per_token", None) if mc else None
+                if topk is None:
+                    topk = getattr(module, "top_k", None) or 8
+            except AttributeError as e:
+                skip(f"attr:{e}")
+                continue
+            idx = len(self._rs_caches)
+            self._rs_caches.append(cache)
+            # Capture-safe smallness bound: the rsplit path is single-wave by
+            # contract, so worst-case uniques (tokens x topk) must fit the
+            # slots. Under piecewise the config-time envelope pins this (and
+            # bounds the whole batch); in eager the branch is evaluated per
+            # step and larger steps fall back to the wave-capable classic
+            # hook.
+            thr = self._rs_thr
+            if thr is None:
+                thr = max(1, min(16, self.expert_cache_slots // int(topk)))
+            if self._rs_staged:
+                dev = module.w13_weight.device
+                self._rs_stage.append(
+                    {
+                        "pin_ids": torch.empty(
+                            (thr * int(topk),),
+                            dtype=torch.int32,
+                            pin_memory=True,
+                        ),
+                        "pin_stamp": torch.zeros(
+                            (1,), dtype=torch.int32, pin_memory=True
+                        ),
+                        "dev_stamp": torch.zeros(
+                            (1,), dtype=torch.int32, device=dev
+                        ),
+                        "seen": 0,
+                    }
+                )
+
+            def make_entry(
+                idx, w13, w2, gne, emap, shared_layer, sel, orig, gate, thr,
+                staged,
+            ):
+                """Bind THIS layer's tensors/callables into a fresh traced
+                entry (a factory, so the loop can't rebind the closure to the
+                last layer's variables). ``emap`` and the weights are captured
+                BY POINTER; the gap op rewrites their contents per step."""
+
+                def _forward_entry(hs, rl, sei, iid, lname, unpad):
+                    if hs.shape[0] > thr:
+                        return orig(hs, rl, sei, iid, lname, unpad)
+                    if gate is not None:
+                        rl, _ = gate(hs)  # mirrors stock _forward_impl
+                    tw, ti = sel(
+                        hidden_states=hs, router_logits=rl, input_ids=iid
+                    )
+                    if staged:
+                        # Captured async D2H + doorbell, inside the piece.
+                        ti = torch.ops.vllm.sluice_stage_ids(ti, idx)
+                    h = torch.ops.vllm.sluice_stream_gap(hs, ti, idx)
+                    routed = torch.ops.vllm.fused_experts(
+                        h,
+                        w13,
+                        w2,
+                        tw,
+                        ti,
+                        activation="silu",
+                        global_num_experts=gne,
+                        expert_map=emap,
+                    )
+                    if shared_layer is None:
+                        return routed
+                    sh = shared_layer(sei if sei is not None else hs)
+                    return (sh, routed)
+
+                return _forward_entry
+
+            if idx == 0 and os.environ.get("SLUICE_RS_DUMP", "0") == "1":
+                # One-shot path forensics: what kernel stack does the classic
+                # apply route through on THIS model (vs our direct
+                # torch.ops.vllm.fused_experts call)?
+                mk = getattr(qm, "fused_experts", None)
+                logger.warning(
+                    "RS-DUMP: qm=%s mk=%s pf=%s expert_impl=%s gne=%d "
+                    "moe_config=%.400s",
+                    type(qm).__name__,
+                    type(mk).__name__ if mk is not None else None,
+                    type(getattr(mk, "prepare_finalize", None)).__name__,
+                    type(getattr(mk, "fused_experts", None)).__name__,
+                    gne,
+                    repr(mc),
+                )
+            runner._forward_entry = make_entry(
+                idx, w13, w2, gne, emap, shared_layer, sel, orig_entry, gate,
+                thr, self._rs_staged,
+            )
+            patched += 1
+        self._rs_layers = patched
+        logger.warning(
+            "Sluice: ROUTER-SPLIT armed on %d/%d MoE layers (traced "
+            "select_experts + captured fused_experts; gap = stream+map only)."
+            " skips=%s",
+            patched,
+            seen_moe,
+            skips or "{}",
+        )
+
+    def attach_model(self, model: nn.Module) -> None:
+        """Model-handle attach point, called by the plugin after load_model.
+
+        Always arms ROUTER-SPLIT first (a no-op unless SLUICE_ROUTER_SPLIT=1;
+        see ``attach_router_split``). Then, only under SLUICE_LAZY_STEP (kept
+        negative result), wraps the model's forward so each engine step runs
+        the offloader in sync-free mode with ONE boundary check: zero misses
+        → commit (the per-layer syncs collapse to one); misses → re-run the
+        same forward with the classic hooked path, which streams the misses
+        and refreshes the standing maps — exact because the same-step rerun
+        overwrites the same KV slots with corrected values and sampling
+        happens once, afterwards."""
+        self.attach_router_split(model)
+        if not self.lazy_step or getattr(model, "_sluice_lazy_wrapped", False):
+            return
+        orig_forward = model.forward
+        offloader = self
+
+        def forward(*a, **k):
+            if offloader._lazy_disabled or not offloader._caches:
+                return orig_forward(*a, **k)
+            try:
+                if offloader._lazy_miss_dev is not None:
+                    offloader._lazy_miss_dev.zero_()
+                offloader._lazy_ran = False
+                offloader._lazy_now = True
+                try:
+                    out = orig_forward(*a, **k)
+                finally:
+                    offloader._lazy_now = False
+                if offloader._lazy_ran and offloader._lazy_miss_dev is not None:
+                    if int(offloader._lazy_miss_dev.item()):  # the ONE sync
+                        offloader._lstep_stats[1] += 1
+                        out = orig_forward(*a, **k)  # classic, streams misses
+                    else:
+                        offloader._lstep_stats[0] += 1
+                else:
+                    offloader._lstep_stats[2] += 1
+                return out
+            except Exception:
+                offloader._lazy_disabled = True
+                logger.exception(
+                    "Sluice: LAZY-STEP disabled after error (classic fallback)."
+                )
+                return orig_forward(*a, **k)
+
+        model.forward = forward
+        model._sluice_lazy_wrapped = True
+        logger.warning(
+            "Sluice: LAZY-STEP armed — one boundary sync per forward, classic "
+            "re-run on miss."
+        )
+
+    def _mark_hook_lite_engaged(self) -> None:
+        """Filesystem proof the standing-map fast path actually executed (INFO
+        logs are invisible in engine subprocesses; a null tok/s result must be
+        distinguishable from 'never ran'). Best-effort; never fatal."""
+        path = os.environ.get("SLUICE_HOOK_LITE_MARKER")
+        if not path:
+            return
+        try:
+            try:
+                import torch.distributed as dist
+
+                rank = dist.get_rank() if dist.is_initialized() else 0
+            except Exception:
+                rank = int(os.environ.get("RANK", "0") or "0")
+            with open(f"{path}.rank{rank}", "w") as f:
+                f.write("engaged\n")
+        except Exception:
+            logger.exception("Sluice: hook-lite marker write failed")
 
     def _stream_in(
         self,
@@ -1432,6 +2751,54 @@ class ExpertStreamOffloader(BaseOffloader):
                     100.0 * s.hits / denom,
                     s.bytes / (1 << 30),
                     s.waves / s.steps,
+                )
+            if self.hook_lite:
+                tot = self._lite_skips + self._lite_writes
+                logger.warning(
+                    "Sluice DIAG[lite]: map-writes skipped=%d written=%d "
+                    "(%.1f%% of single-wave steps skipped)",
+                    self._lite_skips,
+                    self._lite_writes,
+                    100.0 * self._lite_skips / max(tot, 1),
+                )
+            if self.gemm_graph:
+                logger.warning(
+                    "Sluice DIAG[gg]: gemm-graph replays=%d captures=%d "
+                    "disabled=%s",
+                    self._gg_replays,
+                    self._gg_captures,
+                    self._gg_disabled,
+                )
+            if self.router_split:
+                logger.warning(
+                    "Sluice DIAG[rs]: router-split layers=%d gap-calls=%d",
+                    self._rs_layers,
+                    self._rs_gaps,
+                )
+            if self.lazy_step:
+                logger.warning(
+                    "Sluice DIAG[lstep]: clean=%d miss-rerun=%d classic=%d "
+                    "disabled=%s",
+                    self._lstep_stats[0],
+                    self._lstep_stats[1],
+                    self._lstep_stats[2],
+                    self._lazy_disabled,
+                )
+            if self.lazy_sync:
+                # One .item() here (periodic, off the fast path) — the sync-free
+                # invariant is that misses==0; anything else means the residency
+                # gate was violated and the run is NOT correct.
+                misses = (
+                    int(self._lazy_miss_dev.item())
+                    if self._lazy_miss_dev is not None
+                    else 0
+                )
+                logger.warning(
+                    "Sluice DIAG[lazy]: sync-free layer-calls=%d misses=%d "
+                    "%s",
+                    self._lazy_steps,
+                    misses,
+                    "(EXACT)" if misses == 0 else "(!! INCORRECT: gate violated)",
                 )
 
     def get_stats(self) -> dict:

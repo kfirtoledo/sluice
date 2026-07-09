@@ -22,3 +22,10 @@ venv/
 *.log
 baseline.txt
 sluice.txt
+
+# Personal / presentation artifacts
+*.pptx
+*.docx
+~$*
+sendnn-inference/
+assets/slides/
