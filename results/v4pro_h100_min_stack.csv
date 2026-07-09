@@ -1,6 +1,0 @@
-# Smallest H100 stack to serve V4-Pro with Sluice (8192-ctx not tested; batch=1 single-stream).
-# Correct gpu_mem budgeting: total GPU = gpu_mem*80 + slot_cache; leave room for slots.
-tp,gpus,gpu_mem,slots,batch,decode_tok_s,status
-4,4,0.70,8,1,5.12,serves
-2,2,0.68,8,1,4.22,serves — smallest confirmed
-1,1,0.74,8,1,,marginal (all 384 experts local; very slow load, not confirmed)
