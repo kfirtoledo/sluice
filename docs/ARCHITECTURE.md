@@ -177,10 +177,13 @@ The offloader works by rewriting `expert_map`, so the MoE backend **must apply
 ## 8. Slot sizing
 
 `SLUICE_SLOTS` must be ≥ the distinct experts a single step selects (per rank).
-Decode selects few (≈ `top_k` per rank); a large prefill batch can select many,
-so the startup profiling run may briefly overflow and log a warning — expected
-and harmless (profiling output is discarded). If the warning appears during real
-decode, raise the slot count.
+A step unions `top_k` over its tokens, so the count grows with the batch and,
+above all, the prefill chunk size — it is *not* just `top_k`. Measured on V2-Lite
+(64 experts, top-6, one GPU): decode selects 6 for one sequence and ~42 for
+eight, while a prefill chunk selects 53–61. A large prefill batch can therefore
+overflow the startup profiling run and log a warning — expected and harmless
+(profiling output is discarded). If the warning appears during real decode, raise
+the slot count (or cap the prefill chunk with `--max-num-batched-tokens`).
 
 The cache grows ~linearly with the slot count (≈ 2 GiB per expert for V4-Pro), so
 the upper bound is whatever VRAM is left after weights and KV. Raise slots until a
