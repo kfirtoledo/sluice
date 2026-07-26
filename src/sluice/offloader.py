@@ -129,6 +129,9 @@ class _ExpertLayerCache:
     param_names: list[str] = field(default_factory=list)
     gpu_cache: dict[str, torch.Tensor] = field(default_factory=dict)
     cpu_store: dict[str, torch.Tensor] = field(default_factory=dict)
+    # S3 FP8 streaming: host store is fp8, plus a small GPU staging buffer per
+    # tensor that receives the fp8 rows before they are upcast into the slot.
+    fp8_stage: dict[str, torch.Tensor] = field(default_factory=dict)
     local_of: list[int] = field(default_factory=list)
     expert_map_buf: torch.Tensor | None = None
     map_host: torch.Tensor | None = None
@@ -224,6 +227,19 @@ class ExpertStreamOffloader(BaseOffloader):
         self._mk_sync_fills = (
             os.environ.get("SLUICE_MK_SYNC_FILLS", "1") != "0"
         )
+        # H9 probe (flag-gated, diagnostic only): dump the ACTUAL routing ids the
+        # gap acts on, for one layer, across the first N steps. The miss
+        # counter cannot distinguish "gap not called" from "gap called with
+        # stale input" -- this logs the tensor contents, which can.
+        self._h9_probe = os.environ.get("SLUICE_H9_PROBE", "0") == "1"
+        self._h9_sync = os.environ.get("SLUICE_H9_SYNC", "0") == "1"
+        self._h9_hs = 0
+        self._h9_layer = int(os.environ.get("SLUICE_H9_LAYER", "0"))
+        self._h9_seen = 0
+        self._h9_max = int(os.environ.get("SLUICE_H9_STEPS", "12"))
+        # S3 (flag-gated): stream expert weights as fp8 and upcast on arrival.
+        self.fp8_stream = os.environ.get("SLUICE_FP8_STREAM", "0") == "1"
+        self.fp8_stage_rows = int(os.environ.get("SLUICE_FP8_STAGE_ROWS", "32"))
         self.pin_memory = should_pin_memory()
         if not self.pin_memory:
             # Without pinned host memory, ``non_blocking=True`` H2D copies
@@ -1105,11 +1121,28 @@ class ExpertStreamOffloader(BaseOffloader):
                 # and nothing ever streams, so keep no (pinned) host copy.
                 slot.copy_(cpu)
             else:
+                if self.fp8_stream and p.dtype in (torch.bfloat16, torch.float16):
+                    # S3: halve the bytes crossing PCIe. The host copy is cast
+                    # to fp8 ONCE at load; each step then transfers fp8 rows
+                    # into a small GPU staging buffer and upcasts them into the
+                    # bf16 slot on-device, so the wire carries half as much.
+                    # This CHANGES NUMERICS (fp8_e4m3 has ~2 decimal digits),
+                    # so the fidelity gate becomes VALID_DIVERGENT, never
+                    # BIT_IDENTICAL -- stated up front, not discovered later.
+                    cpu = cpu.to(torch.float8_e4m3fn)
+                    stage_n = max(1, min(num_slots, self.fp8_stage_rows))
+                    cache.fp8_stage[name] = torch.empty(
+                        (stage_n, *p.shape[1:]),
+                        dtype=torch.float8_e4m3fn, device=device,
+                    )
                 if self.pin_memory:
                     cpu = cpu.pin_memory()
                 cache.cpu_store[name] = cpu
                 if prefill_resident:
-                    slot[:local_n].copy_(cpu)
+                    if cache.fp8_stage:
+                        slot[:local_n].copy_(cpu.to(p.dtype))
+                    else:
+                        slot[:local_n].copy_(cpu)
             cache.gpu_cache[name] = slot
             p.data = slot
             cache.bytes_per_expert += cpu[0].nbytes
@@ -2525,6 +2558,24 @@ class ExpertStreamOffloader(BaseOffloader):
             #    graph segment, runs ``fn`` eagerly, records it for replay and
             #    reopens a segment. Replay re-runs ``fn`` against the static
             #    input buffers, so the routing it reads is the live step's.
+            if offloader._h9_probe and int(layer_idx) == offloader._h9_layer \
+                    and offloader._h9_hs < offloader._h9_max:
+                # Is the freeze specific to the routing ids, or is the WHOLE
+                # forward frozen upstream of the MoE? Hash the layer input too.
+                import hashlib as _hl2
+
+                _h = hidden_states.detach().float().flatten()[:64].cpu()
+                logger.warning(
+                    "Sluice H9HS[layer=%d step=%d]: hs_sum=%.6f hs_md5=%s "
+                    "hs_ptr=0x%x ids_ptr=0x%x",
+                    int(layer_idx),
+                    offloader._h9_hs,
+                    float(_h.sum()),
+                    _hl2.md5(_h.numpy().tobytes()).hexdigest()[:12],
+                    hidden_states.data_ptr(),
+                    topk_ids.data_ptr(),
+                )
+                offloader._h9_hs += 1
             cap = offloader._breakable_capture()
             # DIAGNOSTIC (SLUICE_BREAK_LAYERS=N): only the first N layers take
             # a segment boundary at all; the rest skip add_eager entirely.
@@ -2674,7 +2725,44 @@ class ExpertStreamOffloader(BaseOffloader):
                 self._rs_stage_falls += 1
                 st["seen"] = int(pin_stamp[0])
         if ids_list is None:
+            # H9 discriminator: is the buffer NOT WRITTEN, or written-but-read-
+            # too-early? A full device sync before the read orders the eager
+            # gap after any in-flight replay of the producing partition.
+            #   fresh contents with sync  -> ordering/liveness race
+            #   still frozen with sync    -> the partition never rewrites it
+            if self._h9_sync:
+                torch.cuda.synchronize()
             ids_list = topk_ids.to("cpu").view(-1).tolist()
+        if (
+            self._h9_probe
+            and idx == self._h9_layer
+            and self._h9_seen < self._h9_max
+        ):
+            # H9: is the tensor crossing the capture->eager seam actually
+            # refreshed each step? Log the contents, not a counter.
+            import hashlib as _hl
+
+            _b = ",".join(str(int(v)) for v in ids_list).encode()
+            # data_ptr discriminates WHY the contents are stale:
+            #   same ptr + frozen contents -> buffer exists, never rewritten
+            #   changing ptr + stale contents -> gap handed a different tensor
+            #                                    carrying old data (a copy)
+            logger.warning(
+                "Sluice H9[layer=%d step=%d]: n=%d sum=%d md5=%s ptr=0x%x "
+                "shape=%s stride=%s storage=%d off=%d first24=%s",
+                idx,
+                self._h9_seen,
+                len(ids_list),
+                sum(int(v) for v in ids_list),
+                _hl.md5(_b).hexdigest()[:12],
+                topk_ids.data_ptr(),
+                tuple(topk_ids.shape),
+                tuple(topk_ids.stride()),
+                topk_ids.untyped_storage().data_ptr(),
+                topk_ids.storage_offset(),
+                [int(v) for v in ids_list[:24]],
+            )
+            self._h9_seen += 1
         local_of = cache.local_of
         n_global = len(local_of)
         if self._rs_fast_hit and cache.map_is_standing:
@@ -2722,6 +2810,11 @@ class ExpertStreamOffloader(BaseOffloader):
             # uniques == slots). The envelope guarantees feasibility:
             # |selected| <= slots  =>  non-selected slots >= misses.
             claimed = set(hit_slots)
+            # Collect every (local -> slot) fill for this step, then submit
+            # them as ONE grouped copy. Slot acquisition still happens per
+            # expert and in the same order, so placement is unchanged and the
+            # result is bit-identical; only the submission cost differs.
+            fills: list[tuple[int, int]] = []
             for local in missing:
                 slot = self._acquire_slot(cache, local, claimed, True)
                 if slot is None:
@@ -2729,8 +2822,9 @@ class ExpertStreamOffloader(BaseOffloader):
                         "Sluice router-split: working set exceeds slots on a "
                         "decode-sized step; raise SLUICE_SLOTS."
                     )
-                self._stream_in(cache, local, slot, copy_stream)
+                fills.append((local, slot))
                 claimed.add(slot)
+            self._stream_in_many(cache, fills, copy_stream)
             self._rs_misses += len(missing)
             self._compute_wait_copies(copy_stream)
             changed = True
@@ -3103,13 +3197,101 @@ class ExpertStreamOffloader(BaseOffloader):
         copy_stream,
         on_stream: bool = False,
     ) -> None:
+        self._stream_in_many(cache, [(local, slot)], copy_stream, on_stream)
+
+    def _stream_in_many(
+        self,
+        cache: _ExpertLayerCache,
+        fills: "list[tuple[int, int]]",
+        copy_stream,
+        on_stream: bool = False,
+    ) -> None:
+        """Batch every (local -> slot) expert copy for one step into a single
+        grouped op instead of one ``cudaMemcpyAsync`` per (expert, tensor).
+
+        The per-expert loop this replaces issued
+        ``len(fills) x len(cache.gpu_cache)`` separate async copies — hundreds
+        per step across 26–43 layers. Measured on V2-Lite, PCIe H2D is **73 %**
+        of the step time at c=8 (14.57 ms total vs a 3.98 ms no-op-gap floor),
+        and small-transfer launch overhead is a large part of that.
+
+        ``torch._foreach_copy_`` submits the same copies, same sources, same
+        destinations, in the same order — so results stay **bit-identical**;
+        only the submission cost changes. Falls back to the plain loop if the
+        foreach op is unavailable.
+        """
+        if not fills:
+            return
+        if cache.fp8_stage:
+            self._stream_in_fp8(cache, fills, copy_stream, on_stream)
+            return
+        dsts: list = []
+        srcs: list = []
+        for name, gpu in cache.gpu_cache.items():
+            cpu = cache.cpu_store[name]
+            for local, slot in fills:
+                dsts.append(gpu[slot])
+                srcs.append(cpu[local])
+
+        def _do() -> None:
+            # Behind a flag so the lever can be measured against an unbatched
+            # arm on the SAME pod/node rather than across nodes.
+            fe = (getattr(torch, "_foreach_copy_", None)
+                  if os.environ.get("SLUICE_BATCH_COPY", "1") == "1" else None)
+            if fe is not None and len(dsts) > 1:
+                fe(dsts, srcs, non_blocking=True)
+            else:
+                for d, s in zip(dsts, srcs):
+                    d.copy_(s, non_blocking=True)
+
         if on_stream or copy_stream is None:
-            for name, gpu in cache.gpu_cache.items():
-                gpu[slot].copy_(cache.cpu_store[name][local], non_blocking=True)
+            _do()
             return
         with torch.cuda.stream(copy_stream):
-            for name, gpu in cache.gpu_cache.items():
-                gpu[slot].copy_(cache.cpu_store[name][local], non_blocking=True)
+            _do()
+
+    def _stream_in_fp8(
+        self,
+        cache: _ExpertLayerCache,
+        fills: "list[tuple[int, int]]",
+        copy_stream,
+        on_stream: bool = False,
+    ) -> None:
+        """S3: transfer fp8 rows, upcast on the GPU.
+
+        Wire traffic is halved versus bf16. The upcast is a device-side cast
+        out of a small staging buffer, so it costs GPU cycles rather than PCIe
+        bandwidth -- which is the trade this lever exists to make, given the
+        measured 73/27 streaming-to-fixed split on V2-Lite.
+        """
+        cap = 0
+        for name in cache.fp8_stage:
+            cap = cache.fp8_stage[name].shape[0]
+            break
+        cap = max(1, cap)
+
+        def _do() -> None:
+            for i in range(0, len(fills), cap):
+                chunk = fills[i:i + cap]
+                for name, gpu in cache.gpu_cache.items():
+                    stage = cache.fp8_stage.get(name)
+                    if stage is None:
+                        for local, slot in chunk:
+                            gpu[slot].copy_(
+                                cache.cpu_store[name][local], non_blocking=True
+                            )
+                        continue
+                    cpu = cache.cpu_store[name]
+                    for j, (local, _slot) in enumerate(chunk):
+                        stage[j].copy_(cpu[local], non_blocking=True)
+                    for j, (_local, slot) in enumerate(chunk):
+                        gpu[slot].copy_(stage[j])
+
+        if on_stream or copy_stream is None:
+            _do()
+            return
+        with torch.cuda.stream(copy_stream):
+            _do()
 
     # -- diagnostics ----------------------------------------------------------
 
