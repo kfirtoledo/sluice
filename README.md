@@ -41,6 +41,11 @@ The captured pieces bake **pointers** (slot buffers, expert-map buffer); the
 gap rewrites their **contents** before each replay reads them. Everything else
 runs under vLLM's own capture machinery.
 
+> ⚠️ **Run router-split with `VLLM_USE_BREAKABLE_CUDAGRAPH=1`.** With Inductor
+> compilation *and* CUDA-graph capture both active, router-split emits invalid
+> output — see [#4](https://github.com/Etelis/sluice/issues/4). Rows marked ⚠️
+> below were measured on that combination and are not valid.
+
 **DeepSeek-V2-Lite** (64 experts top-6, 1×H100, slots=48 → 16/64 offloaded),
 decode tok/s, measured in the July 2026 campaign:
 
@@ -48,11 +53,12 @@ decode tok/s, measured in the July 2026 campaign:
 |---|---|---|
 | classic eager-gap hook (previous plugin best) | 27 | 205 |
 | router-split + fast-hit | 135.7 | 639.7 |
-| **router-split + fast-hit + inductor partition** | **147.2** (6.79 ms) | **1062.6** (7.53 ms) |
+| router-split + fast-hit + inductor partition ⚠️ | 147.2 (6.79 ms) | 1062.6 (7.53 ms) |
 | vanilla vLLM, resident, FULL graphs | 267.1 (3.7 ms) | 984.9 (8.1 ms) |
 
-Single-stream goes **27 → 147 tok/s (5.4×)**, reaching 55% of the vanilla
-full-graph ceiling. At c=8 the offloaded config **crosses the vanilla
+Single-stream goes **27 → 143 tok/s (5.3×)**, reaching 54% of the vanilla
+full-graph ceiling, on the valid configuration. ⚠️ At c=8 the offloaded config
+**crosses the vanilla
 full-graph baseline**: 990–1066 tok/s across seven slots=48 runs vs 985 —
 parity to +8% — while a quarter of the experts live in host RAM (replicated
 on a heavier workload in the eviction-policy matrix).
@@ -63,8 +69,8 @@ that a true resident FULL-graph vanilla baseline exists):
 | arm | c=1 | c=8 | c=12 |
 |---|---|---|---|
 | vanilla resident + FULL graphs | 210.1 (4.76 ms) | 742.3 (10.78 ms) | 700.7 (17.13 ms) |
-| router-split, slots=64 (half offloaded) | 121.2 | **864.5** (9.25 ms) | — |
-| router-split, slots=96 (quarter offloaded) | 122.8 | 883.7 | **1263.8** (9.5 ms) |
+| router-split, slots=64 (half offloaded) ⚠️ | 121.2 | **864.5** (9.25 ms) | — |
+| router-split, slots=96 (quarter offloaded) ⚠️ | 122.8 | 883.7 | **1263.8** (9.5 ms) |
 
 At c=8, offloading **half** the experts beats the resident baseline by **+16%**
 (864.5 vs 742.3). Vanilla degrades past c=8 (TPOT 10.78 → 17.13 ms) while
@@ -87,11 +93,13 @@ pip install -e .   # into an environment that already has vLLM v0.23
 SLUICE_SLOTS=16 python examples/run_dsv4_ep4.py
 
 # ROUTER-SPLIT: offloading + CUDA graphs (worked example: Qwen3-30B, 80 GB H100)
+# VLLM_USE_BREAKABLE_CUDAGRAPH=1 keeps CUDA graphs but disables Inductor; see #4.
 SLUICE_SLOTS=96 SLUICE_PIECEWISE=1 SLUICE_ROUTER_SPLIT=1 SLUICE_RS_FAST_HIT=1 \
+VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve Qwen/Qwen3-30B-A3B \
   --max-num-batched-tokens 12 \
   --gpu-memory-utilization 0.40 \
-  --compilation-config '{"cudagraph_mode": "PIECEWISE", "use_inductor_graph_partition": true}'
+  -cc.cudagraph_mode=PIECEWISE
 ```
 
 Shorthand used below: `MAX_BT=<n>` stands for `--max-num-batched-tokens <n>`,
