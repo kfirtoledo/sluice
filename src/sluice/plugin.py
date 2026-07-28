@@ -94,6 +94,39 @@ def register() -> None:
                 mdl = getattr(self, "model", None)
                 if _ACTIVE is not None and mdl is not None:
                     _ACTIVE.attach_model(mdl)
+                # TELL vLLM ABOUT THE SLOT CACHE.
+                # vLLM captures ``model_memory_usage`` inside the
+                # DeviceMemoryProfiler that wraps model loading
+                # (gpu_model_runner.py:5294) and only afterwards calls
+                # ``get_offloader().post_init()`` (:5381), which is where the
+                # slot buffers are allocated. So the slot cache misses
+                # ``weights_memory``; and because it is allocated BEFORE the
+                # profile run it also sits in the baseline and never shows up
+                # in ``torch_peak_increase``. Both accounting paths miss it.
+                #
+                # Measured consequence (Qwen3-30B-A3B, TP=2, default util):
+                # vLLM reported "Available KV cache memory: 70.29 GiB" at
+                # slots=64 and 70.58 GiB at slots=96 -- a 6.5 GiB difference in
+                # live buffers moving the estimate by 0.29 GiB -- then died in
+                # gpu_worker.initialize_from_config allocating a KV cache that
+                # could not fit. This is why every Sluice benchmark has needed
+                # a hand-lowered --gpu-memory-utilization, with no error
+                # message ever naming Sluice.
+                #
+                # This wrapper runs after post_init and before
+                # determine_available_memory, so it is the right seam to
+                # correct the figure.
+                sb = int(getattr(_ACTIVE, "slot_vram_bytes", 0) or 0)
+                if sb and hasattr(self, "model_memory_usage"):
+                    self.model_memory_usage += sb
+                    logger.info(
+                        "Sluice: reported %.2f GiB of GPU slot cache to vLLM's "
+                        "memory profiler (model_memory_usage %.2f -> %.2f GiB) "
+                        "so the KV cache is sized against real free memory.",
+                        sb / (1 << 30),
+                        (self.model_memory_usage - sb) / (1 << 30),
+                        self.model_memory_usage / (1 << 30),
+                    )
             except Exception:
                 logger.exception(
                     "Sluice: attach_model failed (router-split/lazy-step "

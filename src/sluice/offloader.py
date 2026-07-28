@@ -350,6 +350,28 @@ class ExpertStreamOffloader(BaseOffloader):
         # off) the traced python runs plain, same kernels => bit-identical to
         # stock, verified.
         self.router_split = os.environ.get("SLUICE_ROUTER_SPLIT", "0") == "1"
+        # Permit vLLM's FULL_AND_PIECEWISE cudagraph mode on the BREAKABLE
+        # capture path (compilation mode NONE, e.g. DeepSeek-V4), where the
+        # eager gap comes from BreakableCUDAGraphCapture.add_eager() and NOT
+        # from the fx splitter -- so a "full" graph is still segmented at the
+        # gap and cannot swallow the D2H sync. Forcing plain PIECEWISE throws
+        # away vLLM's full decode graphs, measured at ~16 ms/step on V4.
+        # Refused unless the breakable path is actually active; see
+        # _check_config. Correctness-gated before use.
+        self._allow_full_cg = os.environ.get("SLUICE_ALLOW_FULL_CG", "0") == "1"
+        # Total bytes of the GPU slot cache on this rank, published by
+        # post_init so vLLM's memory profiler can be told about it.
+        self.slot_vram_bytes = 0
+        # DIAGNOSTIC ONLY. Arm router-split even on layers Sluice would skip as
+        # ``static_full``. This is the ONLY configuration in which router-split
+        # is armed AND deterministic: with every expert resident there are no
+        # misses and no dropped experts, so the output must be BIT-IDENTICAL to
+        # vanilla. Without it a correctness gate cannot exist -- at full
+        # residency the layer is skipped (no gap to test), and below it the
+        # cache evicts between steps so misses are unavoidable and the output
+        # legitimately diverges. Never a serving config: it streams nothing and
+        # only costs the gap's overhead.
+        self._rs_force_arm = os.environ.get("SLUICE_RS_FORCE_ARM", "0") == "1"
         self._rs_caches: list = []  # layer_idx -> cache (gap-op registry)
         self._rs_gaps = 0  # DIAG: gap invocations
         self._rs_misses = 0  # DIAG: experts streamed in from the gap
@@ -372,6 +394,34 @@ class ExpertStreamOffloader(BaseOffloader):
         # no-miss steps, keeps the D2H sync).
         self._rs_fast_hit = os.environ.get("SLUICE_RS_FAST_HIT", "0") == "1"
         self._rs_fast_hits = 0
+        # DIAGNOSTIC ONLY (H-KERNEL). Inject N extra *empty* eager breaks per
+        # gap call to measure the marginal cost of a breakable-cudagraph
+        # segment boundary in isolation. Adds breaks WITHOUT adding streaming
+        # work, syncs, or clones, so the slope of TPOT vs N is the pure
+        # per-break cost. The extra fns do nothing, so outputs stay valid;
+        # this is a timing instrument, never a serving config.
+        self._extra_breaks = int(os.environ.get("SLUICE_EXTRA_BREAKS", "0"))
+        # DIAGNOSTIC ONLY. -1 = every layer breaks (normal). N >= 0 = only the
+        # first N layers take a segment boundary; the rest run the gap body
+        # inline. Probes the DOWNWARD break-count curve (43 -> 1 -> 0), which
+        # SLUICE_EXTRA_BREAKS cannot reach. Requires SLUICE_RS_NOOP=1 to be
+        # meaningful: with a no-op body, suppressing the break changes the
+        # break count and nothing else.
+        self._break_layers = int(os.environ.get("SLUICE_BREAK_LAYERS", "-1"))
+        # DIAGNOSTIC ONLY. What the gap op returns, isolating the cost of the
+        # ``hidden_states.clone()`` at its tail:
+        #   0 = clone      (normal: allocate + copy)
+        #   1 = passthrough(return the input tensor: no allocate, no copy)
+        #   2 = empty_like (allocate, do NOT copy -- separates alloc from copy)
+        # Mode 1 returns an alias of an input, which a custom op may not do in
+        # general; it is safe here only because this build runs uncompiled
+        # (breakable-cudagraph forces mode=NONE) and outputs are already
+        # invalid under SLUICE_RS_NOOP=1. Timing instrument, never a serving
+        # config.
+        self._no_clone = int(os.environ.get("SLUICE_NO_CLONE", "0"))
+        # DIAGNOSTIC ONLY. -1 = arm router-split on every eligible MoE layer
+        # (normal). N >= 0 = arm only the first N; see attach_router_split.
+        self._rs_layers = int(os.environ.get("SLUICE_RS_LAYERS", "-1"))
         # Staged-ids (kept negative result — measured 6-8% SLOWER than the
         # classic sync gap): a capturable async D2H of topk_ids into a pinned
         # per-layer buffer INSIDE the captured piece (right after select),
@@ -618,6 +668,16 @@ class ExpertStreamOffloader(BaseOffloader):
             vram_bytes = sum(
                 c.bytes_per_expert * c.num_slots for c in self._caches.values()
             )
+            # Published for the plugin's load_model wrapper, which adds it to
+            # the runner's ``model_memory_usage``. vLLM captures that figure
+            # INSIDE the DeviceMemoryProfiler around model loading
+            # (gpu_model_runner.py:5294) but calls ``post_init`` -- where these
+            # buffers are allocated -- afterwards (:5381). So the slot cache
+            # escapes ``weights_memory``, and because it is allocated before
+            # the profile run it also sits in the baseline and never appears in
+            # ``torch_peak_increase``. Left uncorrected, vLLM sizes the KV cache
+            # as if the slot cache did not exist and OOMs allocating it.
+            self.slot_vram_bytes = vram_bytes
             logger.info(
                 "Sluice: %d MoE layers ready — host expert store %.1f GiB%s, "
                 "GPU slot cache %.1f GiB (per rank).",
@@ -772,10 +832,39 @@ class ExpertStreamOffloader(BaseOffloader):
         cg = getattr(cc, "cudagraph_mode", None) if cc is not None else None
         cg_name = getattr(cg, "name", str(cg)) if cg is not None else "NONE"
         if self.piecewise and "FULL" in cg_name:
-            raise RuntimeError(
-                "Sluice: SLUICE_PIECEWISE requires PIECEWISE cudagraph (the hook "
-                f"runs eager in a graph break); got {cg_name}. FULL would try to "
-                "capture the hook's D2H sync."
+            # On the BREAKABLE capture path the gap does not come from the fx
+            # splitter at all: vLLM sets compilation mode NONE, splitting_ops
+            # is empty, and BreakableCUDAGraphCapture.add_eager() ends the
+            # current segment, runs the gap eagerly and reopens — whatever
+            # cudagraph_mode says. So "FULL" there does not capture the D2H
+            # sync, and refusing it costs vLLM's full decode graphs (~16 ms/step
+            # on V4, measured: forcing PIECEWISE takes 9.81 -> 25.85 ms with no
+            # Sluice in the process at all).
+            #
+            # The refusal below is still correct for the fx-splitting path
+            # (V2-Lite, Qwen3), where a full graph WOULD swallow the hook.
+            mode_name = getattr(getattr(cc, "mode", None), "name", "")
+            breakable = mode_name == "NONE" and not getattr(
+                cc, "splitting_ops", None
+            )
+            if not (self._allow_full_cg and breakable):
+                raise RuntimeError(
+                    "Sluice: SLUICE_PIECEWISE requires PIECEWISE cudagraph (the "
+                    f"hook runs eager in a graph break); got {cg_name}. FULL "
+                    "would try to capture the hook's D2H sync."
+                    + (
+                        " On the breakable-cudagraph path (compilation mode "
+                        "NONE) set SLUICE_ALLOW_FULL_CG=1 to permit it."
+                        if breakable else ""
+                    )
+                )
+            logger.warning(
+                "Sluice: permitting cudagraph_mode=%s because the BREAKABLE "
+                "capture path is active (compilation mode NONE, no "
+                "splitting_ops) — the gap comes from add_eager, not the fx "
+                "splitter. EXPERIMENTAL: verify output correctness before "
+                "trusting any timing from this configuration.",
+                cg_name,
             )
         if (
             cg is not None
@@ -1522,6 +1611,17 @@ class ExpertStreamOffloader(BaseOffloader):
             # Full residency: the identity map is already installed and never
             # changes, so skip the whole routing hook (no D2H sync, no unique,
             # no map rewrite) — the kernel runs exactly as a resident EP rank.
+            return original_apply(*args, **kwargs)
+        if self._rs_noop and self._rs_layers >= 0:
+            # DIAGNOSTIC (SLUICE_RS_LAYERS + SLUICE_RS_NOOP): layers the
+            # RS_LAYERS cap left unarmed fall back to their stock forward,
+            # which lands here. Streaming for real would make "unarmed" mean
+            # "classic hook" instead of "vanilla shape" and destroy the
+            # comparison the sweep exists to make, so under the no-op regime
+            # this path is a passthrough too: NOTHING streams anywhere, and
+            # the only thing N varies is how many layers carry router-split's
+            # op structure. Outputs are already invalid under RS_NOOP.
+            # Gated on both flags, so it is unreachable in any serving config.
             return original_apply(*args, **kwargs)
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             # Unreachable when _check_config passed; a captured hook would
@@ -2384,6 +2484,14 @@ class ExpertStreamOffloader(BaseOffloader):
 
         offloader = self
 
+        def _sluice_noop_break() -> None:
+            """Body of a DIAGNOSTIC extra eager break (SLUICE_EXTRA_BREAKS).
+            Does nothing on purpose: replay still pays the segment boundary
+            (end capture / launch / reopen) and the Python call, but no GPU
+            work, no sync and no copy. Measuring TPOT against the number of
+            these isolates the per-break cost."""
+            return None
+
         def _sluice_stream_gap(
             hidden_states: torch.Tensor,
             topk_ids: torch.Tensor,
@@ -2418,12 +2526,38 @@ class ExpertStreamOffloader(BaseOffloader):
             #    reopens a segment. Replay re-runs ``fn`` against the static
             #    input buffers, so the routing it reads is the live step's.
             cap = offloader._breakable_capture()
-            if cap is not None:
+            # DIAGNOSTIC (SLUICE_BREAK_LAYERS=N): only the first N layers take
+            # a segment boundary at all; the rest skip add_eager entirely.
+            # Tests the DOWNWARD direction of the break-count curve (43 -> 1 ->
+            # 0), which SLUICE_EXTRA_BREAKS (which only adds) cannot reach.
+            # Valid ONLY together with SLUICE_RS_NOOP=1: with a no-op gap body
+            # the skipped call would have done nothing, so this changes the
+            # break count and nothing else. Outputs are already invalid under
+            # RS_NOOP — timing instrument only.
+            lim = offloader._break_layers
+            do_break = cap is not None and (lim < 0 or int(layer_idx) < lim)
+            if do_break:
                 cap.add_eager(
                     lambda: offloader._router_split_gap(int(layer_idx), topk_ids)
                 )
+                # DIAGNOSTIC (SLUICE_EXTRA_BREAKS): N additional segment
+                # boundaries that do nothing. Isolates the marginal cost of a
+                # break from the cost of the gap's work, the D2H sync and the
+                # clone below (all of which stay fixed as N varies).
+                for _ in range(offloader._extra_breaks):
+                    cap.add_eager(_sluice_noop_break)
+            elif cap is not None:
+                # Break suppressed by SLUICE_BREAK_LAYERS: run the (no-op) body
+                # inline so the op still has identical work, minus the boundary.
+                offloader._router_split_gap(int(layer_idx), topk_ids)
             else:
                 offloader._router_split_gap(int(layer_idx), topk_ids)
+            # DIAGNOSTIC (SLUICE_NO_CLONE): see the flag's comment in __init__.
+            nc = offloader._no_clone
+            if nc == 1:
+                return hidden_states
+            if nc == 2:
+                return torch.empty_like(hidden_states)
             return hidden_states.clone()
 
         def _sluice_stream_gap_fake(
@@ -2653,7 +2787,7 @@ class ExpertStreamOffloader(BaseOffloader):
             if runner is None:
                 skip("no-runner")
                 continue
-            if cache.static_full:
+            if cache.static_full and not self._rs_force_arm:
                 skip("static-full")
                 continue
             try:
@@ -2688,6 +2822,16 @@ class ExpertStreamOffloader(BaseOffloader):
                     topk = getattr(module, "top_k", None) or 8
             except AttributeError as e:
                 skip(f"attr:{e}")
+                continue
+            # DIAGNOSTIC (SLUICE_RS_LAYERS=N): arm router-split on only the
+            # first N MoE layers; the rest keep their STOCK ``_forward_entry``,
+            # i.e. vanilla's single fused op. Sweeping N separates a cost that
+            # is per-armed-layer (should scale with N) from one that is a fixed
+            # property of being in this capture mode at all (should not).
+            # Meaningful only with SLUICE_RS_NOOP=1, where nothing streams and
+            # outputs are already invalid — timing instrument, never serving.
+            if self._rs_layers >= 0 and len(self._rs_caches) >= self._rs_layers:
+                skip("rs-layers-cap")
                 continue
             idx = len(self._rs_caches)
             self._rs_caches.append(cache)

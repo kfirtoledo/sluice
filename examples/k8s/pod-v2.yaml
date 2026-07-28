@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata: {name: sluice-v2, namespace: storage, labels: {owner: kfir-toledo, exp: c1c8-v2lite}}
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: NotIn
+            values: ["pokprod-b93r44s0"]
+  containers:
+  - name: vllm
+    image: vllm/vllm-openai:v0.25.1
+    command: ["sleep", "infinity"]
+    resources:
+      requests: {cpu: "8", memory: 120Gi, nvidia.com/gpu: "1"}
+      limits:   {cpu: "16", memory: 160Gi, nvidia.com/gpu: "1"}
+    env: [{name: HF_HOME, value: /vllm-cache/hf}]
+    volumeMounts:
+    - {name: vllm-cache, mountPath: /vllm-cache}
+    - {name: shm, mountPath: /dev/shm}
+    - {name: work, mountPath: /work}
+  volumes:
+  - {name: vllm-cache, persistentVolumeClaim: {claimName: vllm-cache}}
+  - {name: shm, emptyDir: {medium: Memory, sizeLimit: 16Gi}}
+  - {name: work, emptyDir: {}}
