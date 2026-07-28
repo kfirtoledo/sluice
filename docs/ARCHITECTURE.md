@@ -167,12 +167,17 @@ The offloader works by rewriting `expert_map`, so the MoE backend **must apply
 - **Host RAM:** the full per-rank expert shard (processed form), pinned by
   default (`VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1` to disable).
 - **GPU:** non-expert weights + `K` slots × per-expert size × layers + KV cache.
-- **KV-cache caveat.** vLLM sizes the KV cache from the weight memory measured at
-  load time, which excludes both the offloaded experts *and* Sluice's slot
-  caches (installed in `post_init`, after the measurement). It therefore
-  over-budgets KV and can OOM. Lower `gpu_memory_utilization` to leave room (e.g.
-  0.45 for V4 on H100); `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` helps.
-  Measured V4 example: 9.49 GiB weights at load → 24.4 GiB KV at util 0.45.
+- **KV-cache sizing.** vLLM sizes the KV cache from the weight memory measured
+  at load time, which excludes both the offloaded experts *and* Sluice's slot
+  caches (installed in `post_init`, after the `DeviceMemoryProfiler` window).
+  Sluice therefore publishes `slot_vram_bytes` and the plugin adds it to the
+  runner's `model_memory_usage`, so vLLM plans KV around the slot cache. **Pass
+  the same `gpu_memory_utilization` as vanilla, or none at all.**
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` still helps with
+  fragmentation. The published figure must be the *device* footprint:
+  `SLUICE_FP8_STREAM` casts the host store to fp8 while the GPU slot stays
+  bf16, so `bytes_per_expert` (wire) and `vram_bytes_per_expert` (device) are
+  separate fields — conflating them under-counts the cache 2× and OOMs.
 
 ## 8. Slot sizing
 

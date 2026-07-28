@@ -93,14 +93,20 @@ pip install -e .   # into an environment that already has vLLM v0.23
 SLUICE_SLOTS=16 python examples/run_dsv4_ep4.py
 
 # ROUTER-SPLIT: offloading + CUDA graphs (worked example: Qwen3-30B, 80 GB H100)
-# VLLM_USE_BREAKABLE_CUDAGRAPH=1 keeps CUDA graphs but disables Inductor; see #4.
+# The plugin pins VLLM_USE_BREAKABLE_CUDAGRAPH=1 for you (correctness, see #4)
+# and leaves cudagraph_mode alone. --max-num-batched-tokens is the one flag you
+# must still compute: slots // top_k = 96 // 8 = 12.
 SLUICE_SLOTS=96 SLUICE_PIECEWISE=1 SLUICE_ROUTER_SPLIT=1 SLUICE_RS_FAST_HIT=1 \
-VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve Qwen/Qwen3-30B-A3B \
-  --max-num-batched-tokens 12 \
-  --gpu-memory-utilization 0.40 \
-  -cc.cudagraph_mode=PIECEWISE
+  --max-num-batched-tokens 12
 ```
+
+Note what is **not** in that command any more. `--gpu-memory-utilization 0.40`
+was required until the memory-accounting fix — vLLM could not see the slot
+cache and sized KV as if it did not exist — and passing it now just starves the
+KV cache. `-cc.cudagraph_mode=PIECEWISE` threw away vLLM's full decode graphs
+(**+16 ms/step on V4 with no Sluice in the process**). Both were workarounds,
+both are gone; pass neither.
 
 Shorthand used below: `MAX_BT=<n>` stands for `--max-num-batched-tokens <n>`,
 and `INDUCTOR_PARTITION=1` for `use_inductor_graph_partition: true` in the
@@ -120,14 +126,32 @@ aggregate throughput scales with slots, and prefill runs in `MAX_BT`-token
 chunks — slow. Router-split is a **decode** product (a P/D decode worker, or
 short-prompt serving).
 
-**2. Budget slot memory *outside* `gpu_memory_utilization`.**
-Slot buffers allocate **after** vLLM's memory profiling, so vLLM won't plan
-around them — reserve their bytes by lowering `--gpu-memory-utilization`.
-Worked example (Qwen3-30B on 80 GB): slots=96 per layer ≈ 43 GB of slot
-buffers → `--gpu-memory-utilization 0.40` (vLLM plans weights+KV inside
-32 GB, the slot cache takes its 43 GB afterwards). At slots=64 → 0.55, at
-slots=48 → 0.45. Get this wrong and the slot allocation OOMs after profiling
-succeeds.
+**2. Slot memory is budgeted for you — do not lower `gpu_memory_utilization`.**
+Slot buffers allocate in `post_init`, **after** vLLM's `DeviceMemoryProfiler`
+window closes, so vLLM used not to plan around them and sized the KV cache as
+if they did not exist. The documented workaround was to reserve their bytes by
+hand (`slots=96` on Qwen3-30B → `--gpu-memory-utilization 0.40`, and so on).
+**That workaround is obsolete.** Sluice now publishes the slot-cache size and
+the plugin adds it to the runner's `model_memory_usage`, so vLLM subtracts it
+from the KV budget itself. Pass the same value as vanilla, or none at all.
+
+One trap, if you extend the streaming path: the published figure must be the
+**device** footprint. `SLUICE_FP8_STREAM` casts the *host* store to fp8 while
+the GPU slot stays bf16, and deriving the figure from the host tensor
+under-counts the cache 2× — vLLM hands the difference to KV and OOMs at
+startup. Hence `bytes_per_expert` (wire/host) and `vram_bytes_per_expert`
+(device) are separate fields.
+
+A cost worth knowing about rule 1, which Sluice does **not** work around: at
+full residency (`slots >= expert count`) every layer takes the `static_full`
+bypass and router-split arms on **no** layer, yet the envelope is still
+enforced. Measured on Qwen3-30B at `slots=128`, c=128: **1016.9 tok/s capped
+vs 4998.2 uncapped** (vanilla 5161.9). The cap is doing nothing there but it
+is applied anyway, deliberately — full residency offloads nothing, so it is a
+measurement control rather than a deployment, and keeping the rule uniform
+keeps every Sluice number comparable against every other. Measure throughput,
+not TPOT, in this regime: the capped arm reports a *lower* TPOT because most
+requests are queued rather than decoding.
 
 ## Correctness
 
@@ -164,6 +188,7 @@ succeeds.
 | `SLUICE_PROTECT_FRAC` | SLRU | eviction-policy knob; `0` = flat LRU. Measured to not move decode under router-split in any reachable regime — SLRU stays default (never worse, slightly fewer bytes streamed) |
 | `SLUICE_GRAPH=1` | off | full CUDA graphs at **full residency** only (`static_full`); predates router-split |
 | `SLUICE_HOOK_LITE=1` | off | classic-path gap-bookkeeping trim; single-digit % when steps are single-wave |
+| `SLUICE_FP8_STREAM=1` | off | host expert store cast to `float8_e4m3fn` at load; each miss transfers fp8 rows into a staging buffer and upcasts on-device, so the wire carries half the bytes. **+14.6 %** on V2-Lite (slots=60, c=8, four reps per arm, non-overlapping distributions). **Changes numerics** — `VALID_DIVERGENT`, never bit-identical; it also shifts routing, so misses drop ~10 % on top of the byte saving. Off by default because of the numerics, not the speed. |
 
 ### Set for you — you should not need to pass these
 

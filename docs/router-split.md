@@ -423,11 +423,10 @@ because they predict where the approach does and does not transfer.
 
 ### 5.4 Memory-budget rule
 
-Slot buffers allocate **after** vLLM's memory profiling, so they must be
-budgeted **outside** `gpu_memory_utilization` — a violated budget shows up
-as OOM at first allocation, not at profile time. Confirmed repeatedly on
-80 GB H100: Qwen3 slots=64 → `GPU_MEM=0.55`; slots=96 (~43 GB of slots) →
-`0.40`; slots=48 → `0.45`.
+None needed. Sluice publishes `slot_vram_bytes` and the plugin adds it to the
+runner's `model_memory_usage`, so vLLM's profiler accounts for the slot cache
+and sizes the KV cache around it. Pass the same `gpu_memory_utilization` as
+vanilla, or none at all.
 
 ## 6. Negative results (kept in-tree, OFF, with warnings)
 

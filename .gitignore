@@ -29,3 +29,6 @@ sluice.txt
 ~$*
 sendnn-inference/
 assets/slides/
+
+# Campaign records and agent definitions — kept on disk, out of the shipping tree
+.claude/

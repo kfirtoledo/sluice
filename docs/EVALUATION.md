@@ -232,14 +232,14 @@ validated end-to-end. (Full-residency sizing note: the slot cache at
   reference: 226.5 tok/s (the model fits on 4 GPUs; GLM-4.5-Air is the
   correctness/sizing vehicle, not the capability target).
 
-**Operational note — set a lower `gpu_memory_utilization` than resident.** The
-slot cache and map buffers are allocated in the offloader's `post_init`, *after*
-vLLM's memory profiler has already sized the KV cache to the utilization target,
-so at a high value (e.g. 0.85) KV allocation OOMs even though the same model
-loads resident. This is why the V4-Pro eval uses `0.55`; Qwen-MoE needed `~0.45`
-on one GPU. Size the target to leave room for the slot cache — on V4-Pro each
-slot costs **~1.8 GiB per rank** (61 MoE layers × ~30 MB marlin-packed expert),
-so every 6 extra slots needs the utilization dropped by ~0.14.
+**Operational note — slot memory is accounted for you.** Sluice reports the
+slot cache to vLLM's profiler (`slot_vram_bytes`, added to the runner's
+`model_memory_usage`), so vLLM sizes the KV cache around it. Pass the same
+`gpu_memory_utilization` as vanilla, or none at all.
+
+The sizing arithmetic is still worth knowing, because it sets the exchange rate
+the next section measures: on V4-Pro each slot costs **~1.8 GiB per rank**
+(61 MoE layers × ~30 MB marlin-packed expert).
 
 **Spend surplus KV on slots — measured +15–20% at c16.** The utilization knob
 is really a KV-vs-slots split: KV beyond what the workload's concurrent tokens
@@ -542,7 +542,7 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro --tensor-parallel-size 8 \
 SLUICE_SLOTS=24 vllm serve deepseek-ai/DeepSeek-V4-Pro \
   --tensor-parallel-size 8 --enable-expert-parallel \
   --moe-backend marlin --kv-cache-dtype fp8 \
-  --gpu-memory-utilization 0.55 --enforce-eager --trust-remote-code
+  --enforce-eager --trust-remote-code
 
 # H5 — the real numbers: TTFT / TPOT / throughput under load
 vllm bench serve --model deepseek-ai/DeepSeek-V4-Pro \
