@@ -65,6 +65,30 @@ def register() -> None:
             "the offloader lifecycle; vLLM >= 0.25 would otherwise default "
             "some MoE architectures to V2).")
 
+    # CORRECTNESS, not tuning. Router-split emits INVALID OUTPUT when Inductor
+    # compilation and CUDA-graph capture are both active (Etelis/sluice #4;
+    # vLLM 0.23/0.25/0.26 alike). VLLM_USE_BREAKABLE_CUDAGRAPH=1 is what
+    # decouples them: vLLM sets compilation_config.mode = NONE while keeping
+    # capture, so the eager gap comes from BreakableCUDAGraphCapture.add_eager()
+    # instead of the fx splitter. vLLM auto-enables it for DeepSeek-V4 and
+    # MiniMax-M3-Sparse only (vllm/config/vllm.py); every other MoE model has
+    # to be told, and a user who forgets gets plausible-but-wrong tokens with
+    # no error. So pin it rather than document it.
+    #
+    # The cost is real and is accepted deliberately: this disables torch.compile
+    # for the model. On DeepSeek-V4 that is free (vLLM already sets mode=NONE).
+    # On smaller models it is not, but a slower correct answer beats a faster
+    # wrong one. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 explicitly to opt out --
+    # only do that with router-split off.
+    if (os.environ.get("SLUICE_ROUTER_SPLIT", "0") == "1"
+            and os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") is None):
+        os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+        logger.info(
+            "Sluice: pinned VLLM_USE_BREAKABLE_CUDAGRAPH=1 — router-split "
+            "requires it for CORRECT OUTPUT (Inductor + capture together "
+            "produce invalid results). This disables torch.compile for this "
+            "model; that is intended.")
+
     import vllm.model_executor.offloader.base as base_mod
 
     from sluice.offloader import ExpertStreamOffloader

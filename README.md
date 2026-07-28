@@ -158,12 +158,34 @@ succeeds.
 | flag | default | what it does |
 |---|---|---|
 | `SLUICE_SLOTS=N` | unset = plugin inert | N expert slots per layer per rank; experts stream from host RAM |
-| `SLUICE_PIECEWISE=1` | off | piecewise CUDA graphs; streaming runs in an eager gap. Needs `cudagraph_mode=PIECEWISE` (FULL is refused — it would capture the gap) |
+| `SLUICE_PIECEWISE=1` | off | CUDA graphs on; streaming runs in an eager gap |
 | `SLUICE_ROUTER_SPLIT=1` | off | the result above; requires `SLUICE_PIECEWISE=1` and the batch envelope (asserted) |
 | `SLUICE_RS_FAST_HIT=1` | off | all-hit gaps skip LRU/map bookkeeping — exact (the D2H sync stays); +16% c=1, taken by 86–99% of gaps |
 | `SLUICE_PROTECT_FRAC` | SLRU | eviction-policy knob; `0` = flat LRU. Measured to not move decode under router-split in any reachable regime — SLRU stays default (never worse, slightly fewer bytes streamed) |
 | `SLUICE_GRAPH=1` | off | full CUDA graphs at **full residency** only (`static_full`); predates router-split |
 | `SLUICE_HOOK_LITE=1` | off | classic-path gap-bookkeeping trim; single-digit % when steps are single-wave |
+
+### Set for you — you should not need to pass these
+
+| flag | default | why |
+|---|---|---|
+| `VLLM_USE_BREAKABLE_CUDAGRAPH=1` | **pinned by the plugin** when `SLUICE_ROUTER_SPLIT=1` | **Correctness, not tuning.** Router-split emits *invalid output* when Inductor compilation and CUDA-graph capture are both active ([#4](https://github.com/Etelis/sluice/issues/4)). This makes vLLM skip torch.compile (`mode=NONE`) while keeping capture, so the eager gap comes from `add_eager()` rather than the fx splitter. vLLM auto-enables it for DeepSeek-V4/MiniMax only — every other MoE model had to be told, and forgetting produced plausible-but-wrong tokens with no error. Pass `=0` to opt out (only sane with router-split off). |
+| `SLUICE_ALLOW_FULL_CG=1` | **on** | Permits vLLM's default `cudagraph_mode=FULL_AND_PIECEWISE` on the breakable path, where `add_eager()` cuts the capture whatever the mode says — so a "full" graph cannot swallow the D2H sync. Forcing plain `PIECEWISE` throws away vLLM's full **decode** graphs: measured **+16 ms/step on V4 with no Sluice in the process at all**. Still refused on the fx-splitting path, where a full graph genuinely would capture the hook. |
+
+Consequences worth knowing:
+
+* **Do not pass `-cc.cudagraph_mode=PIECEWISE`.** It is what the second flag
+  exists to avoid. On V4 at TP=4: 41.7–44.5 ms forced-PIECEWISE vs **36.4 ms**
+  letting vLLM keep its decode graphs.
+* **Do not hand-tune `--gpu-memory-utilization` down for Sluice.** That was a
+  workaround for a bug — vLLM's memory profiler could not see the slot cache,
+  so it sized the KV cache as if the cache did not exist and OOMed. Fixed;
+  use the same value as vanilla, or none at all.
+* **`--max-num-batched-tokens <= SLUICE_SLOTS // top_k` is still required**
+  under router-split and cannot be relaxed. Router-split is single-wave by
+  contract; the oversized-step fallback is the classic hook, which refuses to
+  run under capture. Relaxing it was tried — the server starts and then dies
+  mid-run.
 
 **Negative results, kept in-tree, OFF, with warnings** — they are correct but
 slower, and the post-mortems say why:

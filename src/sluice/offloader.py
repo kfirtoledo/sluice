@@ -358,7 +358,7 @@ class ExpertStreamOffloader(BaseOffloader):
         # away vLLM's full decode graphs, measured at ~16 ms/step on V4.
         # Refused unless the breakable path is actually active; see
         # _check_config. Correctness-gated before use.
-        self._allow_full_cg = os.environ.get("SLUICE_ALLOW_FULL_CG", "0") == "1"
+        self._allow_full_cg = os.environ.get("SLUICE_ALLOW_FULL_CG", "1") == "1"
         # Total bytes of the GPU slot cache on this rank, published by
         # post_init so vLLM's memory profiler can be told about it.
         self.slot_vram_bytes = 0
