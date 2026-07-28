@@ -39,11 +39,17 @@ def register() -> None:
 
     # Sluice hooks the V1 model runner's create_offloader/post_init lifecycle;
     # the V2 runner never calls it, so Sluice would silently no-op (experts
-    # left resident, or OOM) AND its safety guards would never run. Refuse.
+    # left resident, or OOM) AND its safety guards would never run. Refuse an
+    # explicit user opt-in to V2; otherwise force V1. The force matters on
+    # vLLM >= 0.25, where use_v2_model_runner defaults ON per-architecture
+    # (DeepseekV2/Qwen2Moe/GraniteMoe) when the env var is unset — exactly the
+    # MoE models Sluice targets. vllm.envs reads the environment lazily, and
+    # register() runs in every engine/worker process before the config
+    # property is consulted, so setting the env var here pins V1 everywhere.
     try:
         import vllm.envs as vllm_envs
 
-        if getattr(vllm_envs, "VLLM_USE_V2_MODEL_RUNNER", False):
+        if getattr(vllm_envs, "VLLM_USE_V2_MODEL_RUNNER", None):
             raise RuntimeError(
                 "Sluice requires the V1 model runner but VLLM_USE_V2_MODEL_RUNNER "
                 "is set — the V2 runner never invokes create_offloader/post_init, "
@@ -52,6 +58,12 @@ def register() -> None:
             )
     except ImportError:
         pass
+    if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") is None:
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        logger.info(
+            "Sluice: pinned VLLM_USE_V2_MODEL_RUNNER=0 (the V1 runner hosts "
+            "the offloader lifecycle; vLLM >= 0.25 would otherwise default "
+            "some MoE architectures to V2).")
 
     import vllm.model_executor.offloader.base as base_mod
 

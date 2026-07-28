@@ -10,7 +10,7 @@
 
 ## What Sluice is
 
-Sluice is a plugin for vLLM v0.23 (a `vllm.general_plugins` entry point; setting
+Sluice is a plugin for vLLM v0.23–v0.25 (a `vllm.general_plugins` entry point; setting
 `SLUICE_SLOTS` activates it, unset leaves vLLM untouched) that keeps a model's
 MoE expert weights in host RAM and streams only the router-selected experts
 into a small per-layer GPU slot cache each step. That lets models whose experts
@@ -80,7 +80,7 @@ only offload+graphs path, not merely the fastest.
 ## Quickstart
 
 ```bash
-pip install -e .   # into an environment that already has vLLM v0.23
+pip install -e .   # into an environment that already has vLLM v0.23–v0.25
                    # (Sluice patches a small internal surface — pin vLLM)
 
 # Plain offloading, eager: one env var

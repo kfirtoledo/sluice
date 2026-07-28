@@ -2490,6 +2490,19 @@ class ExpertStreamOffloader(BaseOffloader):
         def skip(reason):
             skips[reason] = skips.get(reason, 0) + 1
 
+        # vLLM <= 0.23: the cache module is the FusedMoE layer and holds its
+        # MoERunner as ``.runner``. vLLM >= 0.25: FusedMoE is a factory, the
+        # cache module is the weight-owning RoutedExperts, and the backlink is
+        # inverted — the runner holds ``.routed_experts``. Build the reverse
+        # map once so both shapes resolve; a cache module matching neither
+        # falls into the existing no-runner skip (fail closed).
+        runner_by_cache = {
+            id(m.routed_experts): m
+            for m in model.modules()
+            if getattr(m, "routed_experts", None) is not None
+            and hasattr(m, "_forward_entry")
+        }
+
         seen_moe = 0
         for module in model.modules():
             cache = self._caches.get(id(module))
@@ -2497,6 +2510,8 @@ class ExpertStreamOffloader(BaseOffloader):
                 continue
             seen_moe += 1
             runner = getattr(module, "runner", None)
+            if runner is None:
+                runner = runner_by_cache.get(id(module))
             if runner is None:
                 skip("no-runner")
                 continue
