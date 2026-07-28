@@ -192,6 +192,10 @@ class ExpertStreamOffloader(BaseOffloader):
             slots executes in multiple waves); larger counts are faster.
     """
 
+    # Resolved once: the vLLM BreakableCUDAGraphCapture class, or False when
+    # this vLLM build has no breakable-cudagraph path. See _breakable_capture.
+    _breakable_cls = None
+
     def __init__(self, expert_cache_slots: int):
         assert expert_cache_slots > 0
         self.expert_cache_slots = expert_cache_slots
@@ -824,7 +828,44 @@ class ExpertStreamOffloader(BaseOffloader):
             self._rs_thr = thr
             sched = getattr(cfg, "scheduler_config", None)
             mbt = getattr(sched, "max_num_batched_tokens", None)
-            if mbt is not None and mbt > thr:
+            # The envelope exists ONLY because dynamo resolves the entry's
+            # `if tokens > thr` branch at trace time and burns it in. When the
+            # model is not dynamo-traced at all -- compilation mode NONE, which
+            # is what VLLM_USE_BREAKABLE_CUDAGRAPH forces (vllm/config/vllm.py)
+            # and what DeepSeek-V4 gets by default -- that branch is evaluated
+            # per step in plain Python, exactly as in eager mode, and oversized
+            # steps fall back to the classic wave-capable hook. docs/
+            # router-split.md §3 says as much for eager: "In pure eager mode
+            # the branch is evaluated per step instead, and oversized steps
+            # fall back to the classic hook -- no envelope needed."
+            #
+            # So enforce the envelope only where its premise holds. This is a
+            # relaxation of a guard whose reason is absent, NOT a correctness
+            # guard being disabled: the fallback path is the same wave-capable
+            # hook the eager gate validates as bit-identical.
+            # MEASURED CORRECTION (2026-07-25): relaxing this on the *captured*
+            # breakable path lets a config start and then die mid-run with
+            # "Sluice: streaming hook reached under CUDA graph capture; run
+            # with enforce_eager" -- because the oversized-step fallback IS the
+            # classic hook, and that hook refuses to run under capture. So the
+            # fallback only exists in pure eager. Relax there and nowhere else,
+            # which is exactly what docs/router-split.md §3 claims.
+            cc_ = getattr(cfg, "compilation_config", None)
+            mode = getattr(cc_, "mode", None)
+            mode_name = getattr(mode, "name", str(mode))
+            cg_ = getattr(cc_, "cudagraph_mode", None)
+            cg_name_ = getattr(cg_, "name", str(cg_)) if cg_ is not None else "NONE"
+            capturing = cg_name_ != "NONE" and not getattr(
+                getattr(cfg, "model_config", None), "enforce_eager", False
+            )
+            traced = not (mode_name == "NONE" or os.environ.get(
+                "VLLM_USE_BREAKABLE_CUDAGRAPH") == "1")
+            # Under capture there is no usable fallback, so the envelope binds
+            # regardless of whether dynamo traced the branch.
+            if capturing:
+                traced = True
+
+            if traced and mbt is not None and mbt > thr:
                 raise RuntimeError(
                     "Sluice router-split under piecewise compiles a single "
                     "trace whose size branch is resolved at trace time; the "
@@ -833,13 +874,26 @@ class ExpertStreamOffloader(BaseOffloader):
                     f"Set --max-num-batched-tokens {thr} (prefill runs in "
                     f"{thr}-token chunks) or raise SLUICE_SLOTS."
                 )
-            logger.warning(
-                "Sluice: ROUTER-SPLIT envelope — max_num_batched_tokens=%s "
-                "<= slots//topk=%d; all steps take the traced split path "
-                "(single-wave by construction).",
-                mbt,
-                thr,
-            )
+            if not traced and mbt is not None and mbt > thr:
+                logger.warning(
+                    "Sluice: ROUTER-SPLIT envelope NOT enforced — this model "
+                    "is not dynamo-traced (compilation mode=%s), so the "
+                    "single-wave branch is evaluated per step. Steps above "
+                    "%d tokens take the classic wave-capable hook; steps at "
+                    "or below it take the split path. max_num_batched_tokens"
+                    "=%s.",
+                    mode_name,
+                    thr,
+                    mbt,
+                )
+            else:
+                logger.warning(
+                    "Sluice: ROUTER-SPLIT envelope — max_num_batched_tokens=%s "
+                    "<= slots//topk=%d; all steps take the traced split path "
+                    "(single-wave by construction).",
+                    mbt,
+                    thr,
+                )
         # Speculative decode / MTP: a decode request verifies (1 + k) tokens,
         # so the decode region is ndec*(1+k) rows. Record k so the pure-decode
         # classifier doesn't mistake spec-decode steps for mixed prefill.
@@ -2293,6 +2347,28 @@ class ExpertStreamOffloader(BaseOffloader):
                 )
             return None
 
+    @staticmethod
+    def _breakable_capture():
+        """Return the vLLM ``BreakableCUDAGraphCapture`` currently capturing on
+        this thread, or None.
+
+        Present only on vLLM builds that ship the breakable-cudagraph path
+        (>= 0.25); absent or inactive everywhere else, in which case the
+        torch.compile ``splitting_ops`` route provides the eager gap instead."""
+        cls = ExpertStreamOffloader._breakable_cls
+        if cls is None:
+            try:
+                from vllm.compilation.breakable_cudagraph import (
+                    BreakableCUDAGraphCapture,
+                )
+            except Exception:
+                ExpertStreamOffloader._breakable_cls = False
+                return None
+            cls = ExpertStreamOffloader._breakable_cls = BreakableCUDAGraphCapture
+        if cls is False:
+            return None
+        return cls.current()
+
     def _register_stream_gap_op(self) -> None:
         """Register ``vllm::sluice_stream_gap`` — the router-split's thin
         eager gap. Functionally pure to the graph (returns a clone consumed by
@@ -2311,29 +2387,82 @@ class ExpertStreamOffloader(BaseOffloader):
         def _sluice_stream_gap(
             hidden_states: torch.Tensor,
             topk_ids: torch.Tensor,
+            expert_map: torch.Tensor,
+            w13: torch.Tensor,
+            w2: torch.Tensor,
             layer_idx: int,
         ) -> torch.Tensor:
-            offloader._router_split_gap(int(layer_idx), topk_ids)
+            # ``expert_map``/``w13``/``w2`` are the buffers this op MUTATES —
+            # they are operands purely so the mutation can be declared (see
+            # ``mutates_args`` below); the body still reaches them through the
+            # per-layer cache. Passing them also makes the data dependency
+            # explicit to the compiler: the downstream expert GEMM consumes the
+            # same tensors, so the gap can no longer be reordered past it,
+            # CSE'd against another layer's gap, or dropped.
+            #
+            # Two ways this op becomes an EAGER gap, depending on how vLLM is
+            # capturing this model:
+            #
+            #  * torch.compile piecewise (V2-Lite, Qwen3, ...): the op is in
+            #    ``splitting_ops``, so the fx splitter cuts the compiled graph
+            #    here and the body runs eagerly between captured pieces.
+            #
+            #  * breakable cudagraph (DeepSeek-V4 and friends): vLLM force-sets
+            #    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` and then
+            #    ``compilation_config.mode = NONE`` (vllm/config/vllm.py), so
+            #    there is no fx graph to split — the body would otherwise run
+            #    INSIDE a raw ``cudaStreamBeginCapture`` region and its D2H
+            #    sync would be illegal. vLLM exposes the break explicitly:
+            #    ``BreakableCUDAGraphCapture.add_eager(fn)`` closes the current
+            #    graph segment, runs ``fn`` eagerly, records it for replay and
+            #    reopens a segment. Replay re-runs ``fn`` against the static
+            #    input buffers, so the routing it reads is the live step's.
+            cap = offloader._breakable_capture()
+            if cap is not None:
+                cap.add_eager(
+                    lambda: offloader._router_split_gap(int(layer_idx), topk_ids)
+                )
+            else:
+                offloader._router_split_gap(int(layer_idx), topk_ids)
             return hidden_states.clone()
 
         def _sluice_stream_gap_fake(
             hidden_states: torch.Tensor,
             topk_ids: torch.Tensor,
+            expert_map: torch.Tensor,
+            w13: torch.Tensor,
+            w2: torch.Tensor,
             layer_idx: int,
         ) -> torch.Tensor:
             return torch.empty_like(hidden_states)
 
+        # TRUTHFUL SIDE-EFFECT CONTRACT.
+        # This op exists FOR its side effects: it streams expert weights into
+        # the slot buffers (``w13``/``w2``, whose storage Sluice re-points at
+        # its cache) and rewrites the standing expert map (``expert_map``).
+        # It was previously registered with ``mutates_args=[]``, i.e. declared
+        # pure. That licenses Dynamo/Inductor to CSE it across layers, reorder
+        # it past the expert GEMM, hoist it out of the replayed region, or drop
+        # repeated executions — none of which is observable in eager (the
+        # Python simply runs every step) but all of which are fatal once the
+        # model is compiled. Measured consequence on V2-Lite: the gap saw 347
+        # misses instead of 4802 and every graphs-on config emitted garbage
+        # (PERF_LOG entries [7], [10]).
         direct_register_custom_op(
             op_name="sluice_stream_gap",
             op_func=_sluice_stream_gap,
-            mutates_args=[],
+            mutates_args=["expert_map", "w13", "w2"],
             fake_impl=_sluice_stream_gap_fake,
         )
 
         if self._rs_staged:
 
             def _sluice_stage_ids(
-                topk_ids: torch.Tensor, layer_idx: int
+                topk_ids: torch.Tensor,
+                pin_ids: torch.Tensor,
+                pin_stamp: torch.Tensor,
+                dev_stamp: torch.Tensor,
+                layer_idx: int,
             ) -> torch.Tensor:
                 st = offloader._rs_stage[int(layer_idx)]
                 n = topk_ids.numel()
@@ -2348,14 +2477,22 @@ class ExpertStreamOffloader(BaseOffloader):
                 return topk_ids
 
             def _sluice_stage_ids_fake(
-                topk_ids: torch.Tensor, layer_idx: int
+                topk_ids: torch.Tensor,
+                pin_ids: torch.Tensor,
+                pin_stamp: torch.Tensor,
+                dev_stamp: torch.Tensor,
+                layer_idx: int,
             ) -> torch.Tensor:
                 return torch.empty_like(topk_ids)
 
+            # Same truthful contract as the gap: this op's entire purpose is to
+            # write the pinned id buffer and advance the doorbell. Declared
+            # pure, its writes were eliminated under compile — measured as
+            # 5999/6000 doorbell fallbacks (PERF_LOG entry [10]).
             direct_register_custom_op(
                 op_name="sluice_stage_ids",
                 op_func=_sluice_stage_ids,
-                mutates_args=[],
+                mutates_args=["pin_ids", "pin_stamp", "dev_stamp"],
                 fake_impl=_sluice_stage_ids_fake,
             )
 
@@ -2485,6 +2622,7 @@ class ExpertStreamOffloader(BaseOffloader):
         if not self.router_split:
             return
         patched = 0
+        packed_layers = 0
         skips: dict = {}
 
         def skip(reason):
@@ -2581,9 +2719,66 @@ class ExpertStreamOffloader(BaseOffloader):
                     }
                 )
 
+            # Which experts call can consume THIS layer's weights?
+            #
+            # ``torch.ops.vllm.fused_experts`` is the generic Triton path: it
+            # assumes w13/w2 are plain floating-point expert stacks. On a
+            # quantized MoE (DeepSeek-V4-Flash is MXFP4 served by MarlinExperts)
+            # the weights are bit-packed into int32, and the op dies inside
+            # ``tl.dot`` with "Unsupported rhs dtype int32". Route those layers
+            # through the layer's own quant method instead — the same
+            # ``qm.apply(...)`` stock vLLM uses — which reads
+            # ``layer.expert_map``, i.e. Sluice's live buffer (see
+            # _install_cache), so the gap's per-step map rewrites still land.
+            packed = w13.dtype not in (
+                torch.float32, torch.float16, torch.bfloat16,
+                torch.float8_e4m3fn, torch.float8_e5m2,
+            )
+            # Stock runs the experts through ``MoERunner._forward_impl``, which
+            # lazily builds the quant config on first forward:
+            #   routed_experts._ensure_moe_quant_config_init()
+            # Router-split replaces ``_forward_entry`` outright, so
+            # ``_forward_impl`` never runs and that init never happens — on a
+            # quantized MoE ``qm.moe_quant_config`` then stays None and apply()
+            # reads the packed weights with the wrong scales (silently wrong
+            # output, not a crash). Arm time is after weight post-processing,
+            # which is exactly the precondition the init documents, so do it
+            # here once rather than per step.
+            # vLLM 0.25 added ``topk_indices_dtype`` to select_experts; 0.23
+            # has no such parameter. Sluice supports 0.23-0.25, so probe the
+            # signature rather than assuming (passing it blind raises
+            # TypeError: unexpected keyword argument on 0.23).
+            try:
+                import inspect as _inspect
+                _tid_ok = "topk_indices_dtype" in _inspect.signature(
+                    runner.router.select_experts
+                ).parameters
+            except (TypeError, ValueError):
+                _tid_ok = False
+            tid = getattr(qm, "topk_indices_dtype", None) if _tid_ok else None
+            tid_ok = _tid_ok
+            init_qc = getattr(module, "_ensure_moe_quant_config_init", None)
+            if callable(init_qc):
+                init_qc()
+            if packed and getattr(qm, "moe_quant_config", None) is None:
+                skip("packed-weights-no-quant-config")
+                self._rs_caches.pop()
+                if self._rs_staged:
+                    self._rs_stage.pop()
+                continue
+            if packed and not callable(getattr(qm, "apply", None)):
+                # No usable seam: fail closed to the stock opaque path rather
+                # than hand packed weights to a kernel that cannot read them.
+                skip(f"packed-weights-no-apply:{w13.dtype}")
+                self._rs_caches.pop()
+                if self._rs_staged:
+                    self._rs_stage.pop()
+                continue
+
             def make_entry(
                 idx, w13, w2, gne, emap, shared_layer, sel, orig, gate, thr,
-                staged,
+                staged, qm, module, se, packed, tid, tid_ok,
+                stage_pin_ids, stage_pin_stamp, stage_dev_stamp,
             ):
                 """Bind THIS layer's tensors/callables into a fresh traced
                 entry (a factory, so the loop can't rebind the closure to the
@@ -2595,23 +2790,52 @@ class ExpertStreamOffloader(BaseOffloader):
                         return orig(hs, rl, sei, iid, lname, unpad)
                     if gate is not None:
                         rl, _ = gate(hs)  # mirrors stock _forward_impl
-                    tw, ti = sel(
-                        hidden_states=hs, router_logits=rl, input_ids=iid
-                    )
+                    # topk_indices_dtype: stock passes the quant method's
+                    # required index dtype into select_experts; omitting it
+                    # leaves the ids in the router's default dtype, which some
+                    # backends' kernels reinterpret. None == "no conversion".
+                    if tid_ok:
+                        tw, ti = sel(
+                            hidden_states=hs, router_logits=rl, input_ids=iid,
+                            topk_indices_dtype=tid,
+                        )
+                    else:  # vLLM 0.23 signature
+                        tw, ti = sel(
+                            hidden_states=hs, router_logits=rl, input_ids=iid,
+                        )
                     if staged:
                         # Captured async D2H + doorbell, inside the piece.
-                        ti = torch.ops.vllm.sluice_stage_ids(ti, idx)
-                    h = torch.ops.vllm.sluice_stream_gap(hs, ti, idx)
-                    routed = torch.ops.vllm.fused_experts(
-                        h,
-                        w13,
-                        w2,
-                        tw,
-                        ti,
-                        activation="silu",
-                        global_num_experts=gne,
-                        expert_map=emap,
+                        # The pinned buffers are operands so the op can declare
+                        # that it writes them (see _register_stream_gap_op).
+                        ti = torch.ops.vllm.sluice_stage_ids(
+                            ti, stage_pin_ids, stage_pin_stamp, stage_dev_stamp,
+                            idx,
+                        )
+                    # emap/w13/w2 are passed so the op can declare it mutates
+                    # them; the same tensors feed the expert GEMM below, which
+                    # pins the ordering the whole design depends on.
+                    h = torch.ops.vllm.sluice_stream_gap(
+                        hs, ti, emap, w13, w2, idx
                     )
+                    if packed:
+                        # Routed half only: pass shared_experts=None so apply
+                        # returns a bare tensor, and let the shared half be
+                        # computed below exactly as on the unquantized path.
+                        # (qm.apply's return type is a single tensor either
+                        # way — folding the shared experts into it would drop
+                        # them from this entry's (shared, routed) contract.)
+                        routed = qm.apply(module, h, tw, ti, None, None)
+                    else:
+                        routed = torch.ops.vllm.fused_experts(
+                            h,
+                            w13,
+                            w2,
+                            tw,
+                            ti,
+                            activation="silu",
+                            global_num_experts=gne,
+                            expert_map=emap,
+                        )
                     if shared_layer is None:
                         return routed
                     sh = shared_layer(sei if sei is not None else hs)
@@ -2636,16 +2860,22 @@ class ExpertStreamOffloader(BaseOffloader):
                 )
             runner._forward_entry = make_entry(
                 idx, w13, w2, gne, emap, shared_layer, sel, orig_entry, gate,
-                thr, self._rs_staged,
+                thr, self._rs_staged, qm, module, se, packed, tid, tid_ok,
+                (self._rs_stage[idx]["pin_ids"] if self._rs_staged else None),
+                (self._rs_stage[idx]["pin_stamp"] if self._rs_staged else None),
+                (self._rs_stage[idx]["dev_stamp"] if self._rs_staged else None),
             )
             patched += 1
+            if packed:
+                packed_layers += 1
         self._rs_layers = patched
         logger.warning(
-            "Sluice: ROUTER-SPLIT armed on %d/%d MoE layers (traced "
-            "select_experts + captured fused_experts; gap = stream+map only)."
-            " skips=%s",
+            "Sluice: ROUTER-SPLIT armed on %d/%d MoE layers (%d via quant "
+            "method apply for packed weights; traced select_experts + captured "
+            "fused_experts; gap = stream+map only). skips=%s",
             patched,
             seen_moe,
+            packed_layers,
             skips or "{}",
         )
 

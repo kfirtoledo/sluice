@@ -42,29 +42,76 @@ gap rewrites their **contents** before each replay reads them. Everything else
 runs under vLLM's own capture machinery.
 
 **DeepSeek-V2-Lite** (64 experts top-6, 1×H100, slots=48 → 16/64 offloaded),
-decode tok/s, measured in the July 2026 campaign:
+decode tok/s. Corrected 2026-07-25 after a validity audit — see
+"Correction: the c=8 figures" below.
 
-| arm | c=1 | c=8 |
-|---|---|---|
-| classic eager-gap hook (previous plugin best) | 27 | 205 |
-| router-split + fast-hit | 135.7 | 639.7 |
-| **router-split + fast-hit + inductor partition** | **147.2** (6.79 ms) | **1062.6** (7.53 ms) |
-| vanilla vLLM, resident, FULL graphs | 267.1 (3.7 ms) | 984.9 (8.1 ms) |
+| arm | c=1 | c=8 | output validity |
+|---|---|---|---|
+| classic eager-gap hook (previous plugin best) | 27 | 205 | bit-identical |
+| **router-split + fast-hit, cudagraphs without Inductor** | **142.7** (7.01 ms) | 232.3 (34.4 ms) | **bit-identical** |
+| vanilla vLLM, resident, FULL graphs | 265.9 (3.76 ms) | 1072.6 (7.46 ms) | reference |
 
-Single-stream goes **27 → 147 tok/s (5.4×)**, reaching 55% of the vanilla
-full-graph ceiling. At c=8 the offloaded config **crosses the vanilla
-full-graph baseline**: 990–1066 tok/s across seven slots=48 runs vs 985 —
-parity to +8% — while a quarter of the experts live in host RAM (replicated
-on a heavier workload in the eviction-policy matrix).
+Single-stream goes **27 → 143 tok/s (5.3×)**, reaching **54% of the vanilla
+full-graph ceiling**, and the offloaded output is **bit-identical to stock** —
+a stronger fidelity result than the scoped eager-only claim below. The
+configuration that produces it keeps CUDA graphs but disables Inductor:
+
+```bash
+SLUICE_PIECEWISE=1 SLUICE_ROUTER_SPLIT=1 SLUICE_RS_FAST_HIT=1 \
+VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
+vllm serve deepseek-ai/DeepSeek-V2-Lite --max-num-batched-tokens 8 \
+  --gpu-memory-utilization 0.50 --moe-backend triton \
+  -cc.cudagraph_mode=PIECEWISE
+```
+
+At c=8 this configuration reaches 232.3 decode tok/s, **0.22× of resident
+vanilla** — offloading does *not* cross the resident full-graph baseline at
+this concurrency.
+
+### Correction: the c=8 figures
+
+Earlier releases of this table reported **1062.6** decode tok/s at c=8 for
+"router-split + fast-hit + inductor partition", and claimed that at c=8 the
+offloaded config *crosses* the vanilla full-graph baseline. **Both were
+measured on a configuration that emits invalid output** and have been removed.
+
+Router-split produces garbage tokens whenever it runs with Inductor
+compilation **and** CUDA-graph capture together — the model emits degenerate
+single-token runs rather than text. Measured facts:
+
+- Either half alone is fine: Inductor without capture, and capture without
+  Inductor (the config in the table above), are both bit-identical to stock.
+- It is **not** a vLLM 0.25 regression — the same configuration emits the same
+  garbage on **vLLM 0.23**, the version the original numbers were produced on.
+  Those numbers were therefore never valid.
+- It does not depend on slot count (36 / 48 / 60), on
+  `max-num-batched-tokens` (1 / 6 / 8 / 10), on `use_inductor_graph_partition`,
+  or on `SLUICE_RS_FAST_HIT` — all measured and excluded.
+
+Root cause is not yet identified; the investigation, the run ledger and the
+per-configuration validity verdicts are in
+`.claude/sessions/results/PERF_LOG.md` (entries [7]–[15]) and
+`runs.jsonl`. **Do not use the Inductor + capture combination until this is
+resolved.**
 
 **Qwen3-30B-A3B** (48 layers × 128 experts top-8, bf16, 1×H100 — small enough
-that a true resident FULL-graph vanilla baseline exists):
+that a true resident FULL-graph vanilla baseline exists).
+
+> ⚠️ **UNVERIFIED — these router-split rows are at risk.** They were produced
+> with Inductor partition **and** CUDA-graph capture, the same combination that
+> is demonstrated above to emit invalid output on DeepSeek-V2-Lite (on both
+> vLLM 0.23 and 0.25). The failure mechanism is a compiler/capture
+> interaction, not a model-specific quirk, so these numbers are very likely
+> affected the same way. **They have not been re-measured** — Qwen3-30B-A3B is
+> not available in this environment's offline model cache — so they are
+> flagged rather than corrected. Treat the router-split rows and the two
+> comparative claims below as unverified pending a validity check.
 
 | arm | c=1 | c=8 | c=12 |
 |---|---|---|---|
 | vanilla resident + FULL graphs | 210.1 (4.76 ms) | 742.3 (10.78 ms) | 700.7 (17.13 ms) |
-| router-split, slots=64 (half offloaded) | 121.2 | **864.5** (9.25 ms) | — |
-| router-split, slots=96 (quarter offloaded) | 122.8 | 883.7 | **1263.8** (9.5 ms) |
+| router-split, slots=64 (half offloaded) ⚠️ | 121.2 | **864.5** (9.25 ms) | — |
+| router-split, slots=96 (quarter offloaded) ⚠️ | 122.8 | 883.7 | **1263.8** (9.5 ms) |
 
 At c=8, offloading **half** the experts beats the resident baseline by **+16%**
 (864.5 vs 742.3). Vanilla degrades past c=8 (TPOT 10.78 → 17.13 ms) while
@@ -86,12 +133,16 @@ pip install -e .   # into an environment that already has vLLM v0.23–v0.25
 # Plain offloading, eager: one env var
 SLUICE_SLOTS=16 python examples/run_dsv4_ep4.py
 
-# ROUTER-SPLIT: offloading + CUDA graphs (worked example: Qwen3-30B, 80 GB H100)
+# ROUTER-SPLIT: offloading + CUDA graphs.
+# VLLM_USE_BREAKABLE_CUDAGRAPH=1 is REQUIRED: it keeps CUDA graphs but disables
+# Inductor. Running router-split with Inductor AND capture together produces
+# INVALID OUTPUT (see "Correction: the c=8 figures" above).
 SLUICE_SLOTS=96 SLUICE_PIECEWISE=1 SLUICE_ROUTER_SPLIT=1 SLUICE_RS_FAST_HIT=1 \
+VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve Qwen/Qwen3-30B-A3B \
   --max-num-batched-tokens 12 \
   --gpu-memory-utilization 0.40 \
-  --compilation-config '{"cudagraph_mode": "PIECEWISE", "use_inductor_graph_partition": true}'
+  -cc.cudagraph_mode=PIECEWISE
 ```
 
 Shorthand used below: `MAX_BT=<n>` stands for `--max-num-batched-tokens <n>`,
@@ -135,9 +186,14 @@ succeeds.
 - **Red-team**: an adversarial pass worked through seven threat scenarios
   against the pointer/content split (capture passes, map staleness, envelope
   edges) and found zero bugs — see [docs/router-split.md](docs/router-split.md).
-- **Compiled-mode numerics**: piecewise outputs differ from eager exactly the
-  way vanilla vLLM's compiled mode differs from its eager mode (inductor
-  fusions), no more.
+- **Compiled-mode numerics** — ⚠️ **RETRACTED 2026-07-25.** This previously
+  read: "piecewise outputs differ from eager exactly the way vanilla vLLM's
+  compiled mode differs from its eager mode (inductor fusions), no more."
+  That is false. With Inductor **and** capture together, router-split output
+  is *degenerate*, not merely numerically different. The controlled comparison:
+  vanilla's own compiled-vs-eager delta stays coherent (5/6 greedy prompts
+  still exactly match eager), while router-split's is 0/6 with degenerate
+  token runs. See "Correction: the c=8 figures" above.
 - **Qwen3 ledger, stated plainly**: V2-Lite is bit-exact everywhere; on Qwen3
   the eager router-split output diverges from the classic hook. Forensics:
   each stack is bit-reproducible run-to-run, identical routing config
