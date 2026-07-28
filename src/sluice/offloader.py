@@ -142,6 +142,15 @@ class _ExpertLayerCache:
     protected: OrderedDict = field(default_factory=OrderedDict)
     probation: OrderedDict = field(default_factory=OrderedDict)
     bytes_per_expert: int = 0
+    # Device bytes one expert occupies in the slot cache. Usually identical to
+    # ``bytes_per_expert``, but SLUICE_FP8_STREAM casts the HOST store to fp8
+    # while the GPU slot stays bf16 — so the wire figure is half the VRAM
+    # figure, and the two must not be conflated. ``bytes_per_expert`` is the
+    # wire/host size (what PCIe carries, what the host store pins);
+    # ``vram_bytes_per_expert`` is the device size (what vLLM must subtract
+    # from the KV budget). Reporting the fp8 figure to vLLM under-counts the
+    # slot cache 2x and OOMs at startup.
+    vram_bytes_per_expert: int = 0
     # LFU hybrid (opt-in): decayed popularity count per local expert, and a
     # per-layer real-step counter driving periodic aging.
     freq: dict = field(default_factory=dict)
@@ -682,7 +691,15 @@ class ExpertStreamOffloader(BaseOffloader):
                 if not c.static_full
             )
             vram_bytes = sum(
-                c.bytes_per_expert * c.num_slots for c in self._caches.values()
+                c.vram_bytes_per_expert * c.num_slots
+                for c in self._caches.values()
+            )
+            # fp8 staging buffers are device allocations too, and they are made
+            # in the same post_init window that vLLM's profiler cannot see.
+            vram_bytes += sum(
+                t.nbytes
+                for c in self._caches.values()
+                for t in c.fp8_stage.values()
             )
             # Published for the plugin's load_model wrapper, which adds it to
             # the runner's ``model_memory_usage``. vLLM captures that figure
@@ -1146,6 +1163,10 @@ class ExpertStreamOffloader(BaseOffloader):
             cache.gpu_cache[name] = slot
             p.data = slot
             cache.bytes_per_expert += cpu[0].nbytes
+            # Measured from the DEVICE tensor, not the host one: under
+            # SLUICE_FP8_STREAM ``cpu`` has been cast to fp8 above while
+            # ``slot`` is still bf16.
+            cache.vram_bytes_per_expert += slot[0].nbytes
 
         orig_map = module.expert_map
         if orig_map is not None:
